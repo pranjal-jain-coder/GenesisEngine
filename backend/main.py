@@ -7,14 +7,14 @@ import asyncio
 import logging
 import json
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List
 from session import ConnectionManager
 from core.llm import LLMFactory
+from core.config import config
 from core.log import setup_logging, console, log_task_start, log_task_done
 from agents.architect import ArchitectAgent, TaskStatus
 from agents.studio.graph import compile_graph
 from services.git_manager import GitManager
-from services.godot_rag import godot_rag
 
 setup_logging()
 logger = logging.getLogger("Orchestrator")
@@ -22,6 +22,12 @@ logger = logging.getLogger("Orchestrator")
 app = FastAPI(title="Genesis Engine Orchestrator")
 manager = ConnectionManager()
 project_tasks = {} # Store tasks for each project
+# Maps project_path → list of {id, description, key_actions} dicts built from
+# each task's Coder execution log after completion. Gives subsequent tasks a
+# concrete picture of what was actually done, not just task descriptions.
+project_task_summaries: Dict[str, List[Dict]] = {}
+# Maps project_path -> task_id -> token usage snapshot at task start.
+project_task_token_baselines: Dict[str, Dict[str, Dict[str, int]]] = {}
 
 # Initialize Agents
 architect = None
@@ -31,19 +37,13 @@ console.rule("[bold cyan]Genesis Engine[/bold cyan]", style="cyan")
 console.print("  [cyan]Orchestrator starting up…[/cyan]\n")
 
 try:
-    llm_provider = LLMFactory.get_provider()
-    architect = ArchitectAgent(llm_provider)
+    llm_flash = LLMFactory.get_provider(config.GEMINI_MODEL_FLASH)
+    llm_lite = LLMFactory.get_provider(config.GEMINI_MODEL_LITE)
+    architect = ArchitectAgent(llm_designer=llm_lite, llm_task_generator=llm_flash)
     studio_agent = compile_graph(manager)
     logger.info("Agents initialized.")
 except Exception as e:
     logger.error(f"Failed to initialize Agents: {e}")
-
-# Pre-build Godot RAG index at startup (non-fatal if it fails)
-try:
-    godot_rag.build_index()
-    logger.info("Godot RAG index ready.")
-except Exception as e:
-    logger.warning(f"Godot RAG index build failed (coder will run without it): {e}")
 
 console.print("  [bold cyan]Ready.[/bold cyan]  Listening on [cyan]ws://0.0.0.0:8000/ws[/cyan]\n")
 
@@ -121,15 +121,18 @@ async def run_studio_agent_step(project_path: str, next_task: Any, websocket: We
             pending = state_full.values.get("pending_review")
             if pending:
                 logger.info(f"[StudioAgent] Pending asset review detected for: {pending.get('name')}")
-                if not manager.is_connected(project_path):
+                # Try to send review request directly
+                try:
+                    await websocket.send_text(json.dumps({
+                        "type": "asset_review_request",
+                        "asset": pending,
+                        "task_id": next_task.id,
+                        "content": f"Please review the acquired asset: {pending.get('name')}"
+                    }))
+                except Exception:
                     logger.warning("[StudioAgent] Client disconnected before asset review could be sent")
-                    return True  # Treat as finished — can't continue without client
-                await websocket.send_text(json.dumps({
-                    "type": "asset_review_request",
-                    "asset": pending,
-                    "task_id": next_task.id,
-                    "content": f"Please review the acquired asset: {pending.get('name')}"
-                }))
+                    return True # Treat as finished — can't continue without client
+
                 return False # Not finished; waiting for human review
             else:
                 # Interrupt fired but no pending review — auto-resume so graph can continue
@@ -140,37 +143,93 @@ async def run_studio_agent_step(project_path: str, next_task: Any, websocket: We
                 # falsely marking the task complete.
                 if state_full.next:
                     logger.error("[StudioAgent] Still stuck at interrupt after auto-resume — bailing")
+                    try:
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "content": "Studio Agent got stuck in an interrupt loop. Execution aborted."
+                        }))
+                    except Exception:
+                        pass
                     return True
 
-        logger.info(f"[StudioAgent] Execution finished for task: {next_task.description}. Requesting verification.")
+        logger.info(f"[StudioAgent] Execution finished for task: {next_task.description}. Auto-completing.")
+
+        # Mark as completed
+        architect.complete_current_task(project_path)
+
+        # Print per-task token usage if provider exposes token snapshot helpers.
+        token_status_msg = None
+        try:
+            provider = getattr(architect, "llm", None)
+            baseline = project_task_token_baselines.get(project_path, {}).pop(next_task.id, None)
+            if provider and baseline and hasattr(provider, "token_usage_since"):
+                token_delta = provider.token_usage_since(baseline)
+                in_tokens = int(token_delta.get("input_tokens", 0))
+                out_tokens = int(token_delta.get("output_tokens", 0))
+                token_status_msg = f"LLM tokens this task: input={in_tokens:,}, output={out_tokens:,}"
+                console.print(
+                    f"  [cyan]{token_status_msg}[/cyan]"
+                )
+        except Exception as token_err:
+            logger.warning("Could not compute per-task token usage: %s", token_err)
+
+        # Extract key actions from the Coder's execution log and store for future tasks
+        try:
+            _summary_state = await studio_agent.aget_state(config)
+            _coder_log = ""
+            for _msg in reversed(_summary_state.values.get("messages", [])):
+                _content = getattr(_msg, 'content', '')
+                if "[Coder]:" in _content:
+                    _coder_log = _content
+                    break
+            _SUMMARY_KEYWORDS = {
+                "[create_scene]", "[instance_scene]", "[create_script]",
+                "[attach_script]", "[open_scene]", "[add_node]",
+            }
+            _action_lines = [
+                line.strip() for line in _coder_log.split('\n')
+                if any(kw in line for kw in _SUMMARY_KEYWORDS)
+                and "FAILED" not in line and "SKIPPED" not in line
+            ]
+            if project_path not in project_task_summaries:
+                project_task_summaries[project_path] = []
+            project_task_summaries[project_path].append({
+                "id": next_task.id,
+                "description": next_task.description,
+                "key_actions": _action_lines[:12],  # cap to avoid bloat
+            })
+        except Exception as _summary_err:
+            logger.warning("Could not extract task execution summary: %s", _summary_err)
+
+        GitManager.commit_state(project_path, f"Completed Task: {next_task.description}")
+        log_task_done(next_task.description)
+
+        # Notify frontend
+        await websocket.send_text(json.dumps({
+            "type": "task_completed",
+            "task_id": next_task.id,
+            "tasks": [t.model_dump(mode='json') for t in architect.tasks]
+        }))
+        if token_status_msg:
+            await websocket.send_text(json.dumps({
+                "type": "status",
+                "content": token_status_msg,
+            }))
         
-        # Do NOT complete the task yet. Ask for user verification.
-        if manager.is_connected(project_path):
-            try:
-                await websocket.send_text(json.dumps({
-                    "type": "task_verification_request",
-                    "task_id": next_task.id,
-                    "content": f"Task '{next_task.description}' finished. Please verify the result in Godot."
-                }))
-            except Exception:
-                logger.warning("[StudioAgent] Client disconnected before verification request could be sent")
-        
-        return True # Execution step finished (interaction pending)
+        return True # Execution step finished
 
     except Exception as e:
         logger.error(f"[StudioAgent] Execution failed: {e}", exc_info=True)
+        project_task_token_baselines.get(project_path, {}).pop(next_task.id, None)
 
-        # Check if the client is still connected before trying to send anything.
-        client_connected = manager.is_connected(project_path)
-
-        if client_connected:
-            try:
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "content": f"Task execution failed: {str(e)}"
-                }))
-            except Exception:
-                client_connected = False
+        # Try to notify execution failure regardless of manager state
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "content": f"Task execution failed: {str(e)}"
+            }))
+        except Exception:
+            pass # Socket dead, move on to revert
 
         # On failure, revert the entire project to the state after the
         # previously completed task.
@@ -193,17 +252,16 @@ async def run_studio_agent_step(project_path: str, next_task: Any, websocket: We
                 if architect:
                     architect.load_project(project_path)
 
-                    if client_connected:
-                        try:
-                            current_gdd = architect.get_current_gdd()
-                            await websocket.send_text(json.dumps({
-                                "type": "project_reverted",
-                                "content": "Project reverted to the last successful task snapshot due to a generation failure.",
-                                "tasks": [t.model_dump(mode='json') for t in architect.tasks],
-                                "gdd": json.loads(current_gdd.to_json()) if current_gdd else {}
-                            }))
-                        except Exception:
-                            pass
+                    try:
+                        current_gdd = architect.get_current_gdd()
+                        await websocket.send_text(json.dumps({
+                            "type": "project_reverted",
+                            "content": "Project reverted to the last successful task snapshot due to a generation failure.",
+                            "tasks": [t.model_dump(mode='json') for t in architect.tasks],
+                            "gdd": json.loads(current_gdd.to_json()) if current_gdd else {}
+                        }))
+                    except Exception:
+                        pass
         return True
 
 @app.websocket("/ws")
@@ -371,6 +429,17 @@ async def websocket_endpoint(websocket: WebSocket):
                                     next_task.status = TaskStatus.IN_PROGRESS
                                     architect.save_tasks(project_path) # Save in-progress state
 
+                                    # Snapshot cumulative token counters at task start.
+                                    try:
+                                        provider = getattr(architect, "llm", None)
+                                        if provider and hasattr(provider, "token_usage_snapshot"):
+                                            if project_path not in project_task_token_baselines:
+                                                project_task_token_baselines[project_path] = {}
+                                            if next_task.id not in project_task_token_baselines[project_path]:
+                                                project_task_token_baselines[project_path][next_task.id] = provider.token_usage_snapshot()
+                                    except Exception as token_err:
+                                        logger.warning("Could not snapshot task token baseline: %s", token_err)
+
                                     logger.info(f"[Execution] Starting next task: {next_task.id} - {next_task.description}")
 
                                     # Auto-commit before task execution
@@ -385,14 +454,24 @@ async def websocket_endpoint(websocket: WebSocket):
                                     ### STUDIO AGENT EXECUTION ###
                                     current_gdd = architect.get_current_gdd()
 
-                                    # Build prior-work context from completed tasks
+                                    # Build prior-work context: task descriptions PLUS what was actually done
                                     completed_tasks = [t for t in architect.tasks if t.status == TaskStatus.COMPLETED]
+                                    _summaries = project_task_summaries.get(project_path, [])
+                                    _summary_map = {s["id"]: s.get("key_actions", []) for s in _summaries}
                                     if completed_tasks:
-                                        completed_lines = "\n".join(
-                                            f"{i+1}. {t.description}"
-                                            for i, t in enumerate(completed_tasks)
+                                        _ctx_lines = []
+                                        for i, t in enumerate(completed_tasks):
+                                            entry = f"{i+1}. {t.description}"
+                                            actions = _summary_map.get(t.id, [])
+                                            if actions:
+                                                entry += "\n   What was actually done:\n" + "\n".join(
+                                                    f"   {a}" for a in actions
+                                                )
+                                            _ctx_lines.append(entry)
+                                        completed_tasks_ctx = (
+                                            "Previously completed tasks (with concrete actions taken):\n"
+                                            + "\n".join(_ctx_lines)
                                         )
-                                        completed_tasks_ctx = f"Previously completed tasks:\n{completed_lines}"
                                     else:
                                         completed_tasks_ctx = ""
 
@@ -605,46 +684,46 @@ async def websocket_endpoint(websocket: WebSocket):
                                         "tasks": [t.model_dump(mode='json') for t in architect.tasks]
                                     }))
 
-                            # 10. Task Verification
-                            elif action == "task_verification_feedback":
-                                feedback = msg.get("feedback")
-                                task_id = msg.get("task_id")
-                                
-                                task = next((t for t in architect.tasks if t.id == task_id), None)
-                                
-                                if task:
-                                    if feedback == "APPROVED":
-                                        logger.info(f"Task {task_id} verified.")
-                                        if task.status != TaskStatus.COMPLETED:
-                                            architect.complete_current_task(project_path)
-                                            GitManager.commit_state(project_path, f"Completed Task: {task.description}")
-
-                                        await websocket.send_text(json.dumps({
-                                            "type": "task_completed",
-                                            "task_id": task.id,
-                                            "tasks": [t.model_dump(mode='json') for t in architect.tasks]
-                                        }))
-                                        
-                                    else:
-                                        logger.info(f"Task {task_id} rejected: {feedback}")
-                                        # Mark attempted as done
-                                        if task.status != TaskStatus.COMPLETED:
-                                            architect.complete_current_task(project_path)
-                                            GitManager.commit_state(project_path, f"Attempted Task: {task.description}")
-
-                                        # Create fix task
-                                        fix_desc = f"Fix: {feedback} (from task '{task.description}')"
-                                        architect.insert_task(fix_desc, project_path, index=0)
-
-                                        await websocket.send_text(json.dumps({
-                                            "type": "task_completed",
-                                            "task_id": task.id,
-                                            "tasks": [t.model_dump(mode='json') for t in architect.tasks]
-                                        }))
-                                        await websocket.send_text(json.dumps({
-                                            "type": "status",
-                                            "content": f"Issue logged. Added fix task: {fix_desc}"
-                                        }))
+                            # 10. Task Verification (Disabled)
+                            # elif action == "task_verification_feedback":
+                            #     feedback = msg.get("feedback")
+                            #     task_id = msg.get("task_id")
+                            #     
+                            #     task = next((t for t in architect.tasks if t.id == task_id), None)
+                            #     
+                            #     if task:
+                            #         if feedback == "APPROVED":
+                            #             logger.info(f"Task {task_id} verified.")
+                            #             if task.status != TaskStatus.COMPLETED:
+                            #                 architect.complete_current_task(project_path)
+                            #                 GitManager.commit_state(project_path, f"Completed Task: {task.description}")
+                            #
+                            #             await websocket.send_text(json.dumps({
+                            #                 "type": "task_completed",
+                            #                 "task_id": task.id,
+                            #                 "tasks": [t.model_dump(mode='json') for t in architect.tasks]
+                            #             }))
+                            #             
+                            #         else:
+                            #             logger.info(f"Task {task_id} rejected: {feedback}")
+                            #             # Mark attempted as done
+                            #             if task.status != TaskStatus.COMPLETED:
+                            #                 architect.complete_current_task(project_path)
+                            #                 GitManager.commit_state(project_path, f"Attempted Task: {task.description}")
+                            #
+                            #             # Create fix task
+                            #             fix_desc = f"Fix: {feedback} (from task '{task.description}')"
+                            #             architect.insert_task(fix_desc, project_path, index=0)
+                            #
+                            #             await websocket.send_text(json.dumps({
+                            #                 "type": "task_completed",
+                            #                 "task_id": task.id,
+                            #                 "tasks": [t.model_dump(mode='json') for t in architect.tasks]
+                            #             }))
+                            #             await websocket.send_text(json.dumps({
+                            #                 "type": "status",
+                            #                 "content": f"Issue logged. Added fix task: {fix_desc}"
+                            #             }))
 
                             # 11. Get Task/Commit History
                             elif action == "get_task_history":
@@ -653,6 +732,83 @@ async def websocket_endpoint(websocket: WebSocket):
                                     "type": "task_history",
                                     "commits": commits
                                 }))
+
+                            # 12. Check Task Status (Reconnection Sync)
+                            elif action == "check_task_status":
+                                task_id = msg.get("task_id")
+                                logger.info(f"[Recovery] Client requested status check for task {task_id}")
+                                
+                                # Find if this task is still considered active
+                                task = next((t for t in architect.tasks if t.id == task_id), None)
+                                
+                                if not task:
+                                    # Task not found or already done?
+                                    # Check strict status
+                                    # If it's missing, tell client to stop waiting.
+                                    await websocket.send_text(json.dumps({
+                                        "type": "error",
+                                        "content": f"Task {task_id} not found or no longer active."
+                                    }))
+                                elif task.status == TaskStatus.COMPLETED:
+                                    # Already done, maybe verification was missed?
+                                    # But marked completed only *after* verification.
+                                    # So if completed, client missed the completion message.
+                                    await websocket.send_text(json.dumps({
+                                        "type": "task_completed",
+                                        "task_id": task.id,
+                                        "tasks": [t.model_dump(mode='json') for t in architect.tasks]
+                                    }))
+                                elif task.status == TaskStatus.IN_PROGRESS:
+                                    # It's in progress. Check agent state.
+                                    thread_config = {"configurable": {"thread_id": project_path}}
+                                    try:
+                                        state_snap = await studio_agent.aget_state(thread_config)
+                                        
+                                        # Case 1: Pending Asset Review
+                                        pending = state_snap.values.get("pending_review")
+                                        if pending:
+                                            logger.info("[Recovery] Resending pending asset review.")
+                                            await websocket.send_text(json.dumps({
+                                                "type": "asset_review_request",
+                                                "asset": pending,
+                                                "task_id": task.id,
+                                                "content": f"Please review the acquired asset: {pending.get('name')}"
+                                            }))
+                                        
+                                        # Case 2: Finished (Waiting for Verification) -> Auto-complete catchup
+                                        elif not state_snap.next:
+                                            # Graph has no next steps -> Finished run -> Completed
+                                            # If we are here, it means task is IN_PROGRESS but agent thinks it's done.
+                                            # This is the "just finished" state.
+                                            logger.info("[Recovery] Agent finished. Marking complete.")
+                                            architect.complete_current_task(project_path)
+                                            GitManager.commit_state(project_path, f"Completed Task: {task.description}")
+
+                                            await websocket.send_text(json.dumps({
+                                                "type": "task_completed",
+                                                "task_id": task.id,
+                                                "tasks": [t.model_dump(mode='json') for t in architect.tasks]
+                                            }))
+                                            
+                                        # Case 3: Still Running (or Interrupted w/o Review)
+                                        else:
+                                            # It's waiting on something or just interrupted.
+                                            # If it was interrupted without pending review, it might be stuck or we need to resume.
+                                            # But purely "status check" shouldn't trigger execution side effects easily.
+                                            # Just tell client we are working.
+                                            logger.info("[Recovery] Agent execution seems incomplete but active. Sending busy status.")
+                                            await websocket.send_text(json.dumps({
+                                                "type": "status",
+                                                "content": f"Task '{task.description}' is still processing..."
+                                            }))
+                                            # Optional: Kick it? No, unsafe here.
+                                            
+                                    except Exception as e:
+                                        logger.error(f"[Recovery] Failed to check agent state: {e}")
+                                        await websocket.send_text(json.dumps({
+                                            "type": "error",
+                                            "content": "Failed to retrieve task state."
+                                        }))
 
                             # 9. Revert Project
                             elif action == "revert_project":

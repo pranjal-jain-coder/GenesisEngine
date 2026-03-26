@@ -57,6 +57,7 @@ func _process(delta: float) -> void:
 			var reason = socket.get_close_reason()
 			print("BridgeClient: Connection closed. Code: %d, Reason: %s" % [code, reason])
 			is_registered = false
+			connection_changed.emit(false)
 			socket = null
 			reconnect_timer = 0.0
 
@@ -84,7 +85,7 @@ func _send_registration() -> void:
 		print("BridgeClient: Failed to send registration message. Error: %d" % err)
 
 func _handle_incoming_message(message: String) -> void:
-	print("BridgeClient: Received message: %s" % message)
+	# print("BridgeClient: Received message: %s" % message)
 	var json = JSON.new()
 	var parse_result = json.parse(message)
 	if parse_result != OK:
@@ -96,17 +97,22 @@ func _handle_incoming_message(message: String) -> void:
 		print("BridgeClient: Received data is not a dictionary.")
 		return
 	
-	# Check if it's a JSON-RPC response (has "result" or "error" field)
-	if data.has("result") or data.has("error"):
-		print("BridgeClient: Received JSON-RPC response: %s" % str(data))
-		# If this is the registration confirmation, request the saved project state
-		if data.has("result") and typeof(data["result"]) == TYPE_DICTIONARY and data["result"].get("status") == "connected":
-			_request_project_state()
-		return
-	
-	# Check if it's a command (has "method" field)
+	# Commands must be handled first. Older logic routed all non-response
+	# messages to UI events and returned early, dropping JSON-RPC commands.
 	if data.has("method"):
 		_handle_command(data)
+	# Compatibility: some backends send a plain handshake object like
+	# {"status":"connected","path":"..."} rather than JSON-RPC.
+	elif data.has("status") and data.get("status", "") == "connected":
+		connection_changed.emit(true)
+	# Check if it's a JSON-RPC response (has "result" or "error" field)
+	elif data.has("result") or (data.has("error") and data.has("id")):
+		# This is usually a response to a command we sent.
+		# Also treat initial registration ack as a connection event.
+		var res = data.get("result", {})
+		if typeof(res) == TYPE_DICTIONARY and res.get("status", "") == "connected":
+			connection_changed.emit(true)
+			_request_project_state()
 	elif data.has("type"):
 		# Check for known types to forward to UI
 		var type = data["type"]
@@ -116,7 +122,7 @@ func _handle_incoming_message(message: String) -> void:
 		else:
 			print("BridgeClient: Received message of unknown type: %s" % type)
 	else:
-		print("BridgeClient: Received message with unknown format (no 'method', 'result', or 'error' field)")
+		print("BridgeClient: Received message with unknown format: %s" % str(data))
 
 func _request_project_state() -> void:
 	"""Request the current project state (GDD + tasks) from the backend."""
@@ -202,6 +208,8 @@ func _handle_command(cmd_dict: Dictionary) -> void:
 			result = _cmd_write_script(params)
 		"reload_project":
 			result = _cmd_reload_project(params)
+		"delete_node":
+			result = _cmd_delete_node(params)
 		"add_node":
 			result = _cmd_add_node(params)
 		"set_property":
@@ -304,6 +312,14 @@ func _cmd_create_scene(params: Dictionary) -> Dictionary:
 	if save_result != OK:
 		return {"success": false, "message": "Failed to save scene to %s. Error: %d" % [path, save_result]}
 
+	# Auto-save the currently open scene before switching — same behaviour as
+	# open_scene. Without this, any unsaved in-memory changes (e.g. an
+	# instance_scene that hasn't had save_scene called yet) would be silently
+	# discarded, causing the AI to later re-instance scenes and create duplicates.
+	var current_before_switch = EditorInterface.get_edited_scene_root()
+	if current_before_switch != null:
+		EditorInterface.save_scene()
+
 	# Open the newly created scene so subsequent add_node / set_property
 	# commands target it (they use EditorInterface.get_edited_scene_root()).
 	var res_path = path
@@ -315,6 +331,14 @@ func _cmd_create_scene(params: Dictionary) -> Dictionary:
 	# JSON-RPC response is sent.  Synchronous scan() can trigger @tool
 	# script reloads mid-frame → SIGSEGV.
 	EditorInterface.get_resource_filesystem().call_deferred("scan")
+
+	# Serialize the new scene root in the same handler so the AI knows the
+	# starting tree state without a separate round-trip.
+	var new_root = EditorInterface.get_edited_scene_root()
+	if new_root != null:
+		var scene_data = _serialize_node(new_root, new_root)
+		return {"success": true, "message": "Successfully created scene at %s" % path, "scene_tree": scene_data}
+
 	return {"success": true, "message": "Successfully created scene at %s" % path}
 
 func _cmd_write_script(params: Dictionary) -> Dictionary:
@@ -360,6 +384,41 @@ func _cmd_reload_project(params: Dictionary) -> Dictionary:
 	EditorInterface.reload_scene_from_path(scene_path)
 	return {"success": true, "message": "Successfully reloaded scene from %s" % scene_path}
 
+func _cmd_delete_node(params: Dictionary) -> Dictionary:
+	if not params.has("node_path"):
+		return {"success": false, "message": "delete_node requires 'node_path'"}
+
+	var node_path = params["node_path"]
+
+	var edited_scene = EditorInterface.get_edited_scene_root()
+	if edited_scene == null:
+		return {"success": false, "message": "No edited scene root found"}
+
+	# Refuse to delete the scene root — that would destroy the whole scene.
+	if node_path == "." or node_path == "":
+		return {"success": false, "message": "Cannot delete the scene root. Use create_scene to replace it."}
+
+	var target: Node = edited_scene.get_node_or_null(node_path)
+	if target == null:
+		return {"success": false, "message": "Node '%s' not found in the current scene." % node_path}
+
+	# Refuse to delete a PackedScene instance root — that is a structural decision
+	# that should be handled deliberately (e.g. redesigning the scene layout).
+	# Deleting an instance root silently removes its entire sub-tree and cannot be
+	# undone by the AI without re-running instance_scene.
+	var target_scene_path = _scene_file_path_of(target)
+	if target_scene_path != "":
+		return {
+			"success": false,
+			"message": "Cannot delete '%s': it is a scene instance root (source: '%s'). Use instance_scene with allow_multiple or redesign the scene instead." % [node_path, target_scene_path]
+		}
+
+	var parent_name = target.get_parent().name if target.get_parent() else "unknown"
+	var deleted_name = target.name
+	target.get_parent().remove_child(target)
+	target.queue_free()
+	return {"success": true, "message": "Deleted node '%s' (was child of '%s')." % [deleted_name, parent_name]}
+
 func _cmd_add_node(params: Dictionary) -> Dictionary:
 	if not params.has("parent_path") or not params.has("node_type") or not params.has("node_name"):
 		return {"success": false, "message": "add_node requires 'parent_path', 'node_type', and 'node_name'"}
@@ -380,6 +439,25 @@ func _cmd_add_node(params: Dictionary) -> Dictionary:
 
 	if parent_node == null:
 		return {"success": false, "message": "Parent node '%s' not found. Call read_scene first to verify the scene tree." % parent_path}
+
+	# ARCHITECTURE GUARD:
+	# Prevent adding nodes to any node that is — or is nested inside — a PackedScene
+	# instance. Doing so creates local scene overrides that cause "name clashes" Load
+	# Errors whenever the source scene already has a node with that name.
+	# Walk UP the tree from parent_node to the scene root; if any ancestor (including
+	# parent_node itself) is a packed-scene instance root, reject the call.
+	var check_node = parent_node
+	while check_node != null and check_node != edited_scene:
+		var check_scene_path = _scene_file_path_of(check_node)
+		if check_scene_path != "":
+			var msg = "ARCHITECTURAL VIOLATION: '%s' is inside the scene instance '%s' (source: '%s'). " % [parent_path, check_node.name, check_scene_path]
+			msg += "Adding nodes here creates local overrides that cause Godot Load Errors. "
+			msg += "REQUIRED ACTION: call open_scene('%s'), then add the node there instead." % check_scene_path
+			return {
+				"success": false,
+				"message": msg
+			}
+		check_node = check_node.get_parent()
 
 	# Guard against duplicates: if a child with this name already exists, skip.
 	var existing = parent_node.get_node_or_null(node_name)
@@ -494,8 +572,12 @@ func _cmd_save_scene(params: Dictionary) -> Dictionary:
 	var scene_path = edited_scene.scene_file_path
 	if scene_path == "":
 		scene_path = params.get("path", "")
-		if scene_path == "":
+	if scene_path == "":
 			return {"success": false, "message": "Scene has no file path and none was provided"}
+
+	# Ensure PackedScene instance descendants are never serialised as local
+	# overrides in the parent scene. We only keep ownership on instance roots.
+	_prepare_scene_for_saving(edited_scene)
 
 	var packed = PackedScene.new()
 	var pack_result = packed.pack(edited_scene)
@@ -505,6 +587,12 @@ func _cmd_save_scene(params: Dictionary) -> Dictionary:
 	var save_result = ResourceSaver.save(packed, scene_path)
 	if save_result != OK:
 		return {"success": false, "message": "Failed to save scene to %s. Error: %d" % [scene_path, save_result]}
+
+	# Register the newly-saved PackedScene into the ResourceLoader cache so that
+	# subsequent load(scene_path) calls (e.g. in instance_scene) return this
+	# version and not the stale pre-save entry.  ResourceSaver.save() writes to
+	# disk but does NOT update the cache; take_over_path() does both.
+	packed.take_over_path(scene_path)
 
 	EditorInterface.get_resource_filesystem().call_deferred("scan")
 	return {"success": true, "message": "Scene saved to %s" % scene_path}
@@ -522,7 +610,23 @@ func _cmd_open_scene(params: Dictionary) -> Dictionary:
 		return {"success": false, "message": "Scene file not found: %s" % path}
 	fa.close()
 
+	# Save the currently open scene before switching so unsaved in-memory changes
+	# (e.g. an instance_scene call that hasn't been save_scene'd yet) are not lost.
+	# Without this, the AI can open a different scene, lose all pending edits to the
+	# current one, re-open it from disk (clean), and add duplicate nodes.
+	var current = EditorInterface.get_edited_scene_root()
+	if current != null:
+		EditorInterface.save_scene()
+
 	EditorInterface.open_scene_from_path(path)
+
+	# Serialize the scene tree in the same handler — avoids the two-round-trip
+	# timing race where a separate read_scene call could still see the previous scene.
+	var new_root = EditorInterface.get_edited_scene_root()
+	if new_root != null:
+		var scene_data = _serialize_node(new_root, new_root)
+		return {"success": true, "message": "Opened scene: %s" % path, "scene_tree": scene_data}
+
 	return {"success": true, "message": "Opened scene: %s" % path}
 
 func _cmd_instance_scene(params: Dictionary) -> Dictionary:
@@ -532,6 +636,7 @@ func _cmd_instance_scene(params: Dictionary) -> Dictionary:
 	var scene_path = params["scene_path"]
 	var parent_path = params["parent_path"]
 	var node_name = params.get("node_name", "")
+	var allow_multiple = params.get("allow_multiple", false)
 
 	if not scene_path.begins_with("res://"):
 		scene_path = "res://" + scene_path
@@ -549,10 +654,22 @@ func _cmd_instance_scene(params: Dictionary) -> Dictionary:
 	if parent_node == null:
 		return {"success": false, "message": "Parent node '%s' not found" % parent_path}
 
-	var packed_scene = load(scene_path)
+	# Use CACHE_MODE_REPLACE to always read the latest version from disk.
+	# A plain load() returns whatever is in the ResourceLoader cache, which may
+	# be stale if save_scene was called just before this (the cache is only
+	# updated by take_over_path / EditorInterface.save_scene, not ResourceSaver.save).
+	var packed_scene = ResourceLoader.load(scene_path, "", ResourceLoader.CACHE_MODE_REPLACE)
 	if packed_scene == null:
 		return {"success": false, "message": "Failed to load scene: %s" % scene_path}
 
+	# Use the default GEN_EDIT_STATE_DISABLED (plain instantiate()).
+	# GEN_EDIT_STATE_INSTANCE must NOT be used here: it attaches instance-state
+	# metadata to each child node, which causes PackedScene.pack() to serialize
+	# them as local override entries in the parent .tscn even when their owner
+	# is null — producing exactly the "Load Error: name clashes" we are trying
+	# to prevent.  With GEN_EDIT_STATE_DISABLED, children have owner = null and
+	# pack() ignores them entirely; only the instance root (owner = edited_scene)
+	# is written as a single [node name="Player" instance=ExtResource(...)] line.
 	var instance = packed_scene.instantiate()
 	if instance == null:
 		return {"success": false, "message": "Failed to instantiate scene: %s" % scene_path}
@@ -560,9 +677,26 @@ func _cmd_instance_scene(params: Dictionary) -> Dictionary:
 	if node_name != "":
 		instance.name = node_name
 
-	# Guard against duplicates: if a child with this name already exists, skip.
+	# Guard against duplicates by scene path.
+	# Unless allow_multiple is true, reject any second instance of the same .tscn
+	# ANYWHERE in the entire edited scene — regardless of parent_path or node_name.
+	# Checking only parent_node.get_children() is insufficient: if the AI used a
+	# different parent_path on a previous run (e.g. "." vs "Entities"), the guard
+	# would miss the already-existing instance and add a duplicate.
+	if not allow_multiple:
+		var existing_instance = _find_scene_instance_recursive(edited_scene, scene_path)
+		if existing_instance != null:
+			instance.free()
+			return {
+				"success": true,
+				"message": "Scene '%s' is already instanced as '%s' in this scene — skipped. Use allow_multiple:true only when multiple instances are intentional (e.g. enemies, coins)." % [scene_path, existing_instance.name],
+				"already_existed": true
+			}
+
+	# Secondary guard: if a child with this exact name already exists, skip.
 	var effective_name = instance.name
-	var existing = parent_node.get_node_or_null(effective_name)
+	var existing_path: NodePath = NodePath(str(effective_name))
+	var existing = parent_node.get_node_or_null(existing_path)
 	if existing != null:
 		instance.free()
 		return {
@@ -572,13 +706,63 @@ func _cmd_instance_scene(params: Dictionary) -> Dictionary:
 		}
 
 	parent_node.add_child(instance)
-	# Only set owner on the instance root, NOT its children.
-	# Setting owner recursively on a sub-scene's internal nodes causes Godot
-	# to treat them as locally-owned nodes, making their names clash with
-	# other nodes in the parent scene and showing 'Load Error' warnings.
+	# Set owner on the instance root ONLY.  Node.owner is a single-node setter —
+	# it does NOT propagate to children.  Children retain owner = null (set by
+	# the plain instantiate() call above), so PackedScene.pack() will not include
+	# them in the parent .tscn file.
 	instance.owner = edited_scene
 
-	return {"success": true, "message": "Instanced '%s' as child of '%s'" % [scene_path, parent_path]}
+	# Return the instance's internal node tree so the AI knows what nodes are already
+	# inside it — it must NOT call add_node targeting this instance or its children.
+	var instance_tree = _serialize_node(instance, instance)
+	return {
+		"success": true,
+		"message": "Instanced '%s' as '%s' (child of '%s'). Nodes inside this instance belong to its source scene — do NOT add them here." % [scene_path, instance.name, parent_path],
+		"instance_tree": instance_tree
+	}
+
+func _find_scene_instance_recursive(node: Node, scene_path: String) -> Node:
+	"""Recursively search the subtree rooted at node for any child that is an
+	instance of scene_path. Returns the first match, or null if none found.
+	Does NOT check node itself — only its descendants."""
+	for child in node.get_children():
+		if child.get_scene_file_path() == scene_path:
+			return child
+		var found = _find_scene_instance_recursive(child, scene_path)
+		if found != null:
+			return found
+	return null
+
+
+func _scene_file_path_of(node: Node) -> String:
+	if node == null:
+		return ""
+	return str(node.get_scene_file_path())
+
+
+func _clear_owner_recursive(node: Node) -> void:
+	node.owner = null
+	for child in node.get_children():
+		_clear_owner_recursive(child)
+
+
+func _prepare_scene_for_saving(scene_root: Node) -> void:
+	for child in scene_root.get_children():
+		_prepare_subtree_for_saving(scene_root, child)
+
+
+func _prepare_subtree_for_saving(scene_root: Node, node: Node) -> void:
+	var src_scene = _scene_file_path_of(node)
+	if src_scene != "":
+		# Keep only the instance root owned by the edited scene so pack()
+		# emits a single instance=ExtResource(...) node line.
+		node.owner = scene_root
+		for child in node.get_children():
+			_clear_owner_recursive(child)
+		return
+
+	for child in node.get_children():
+		_prepare_subtree_for_saving(scene_root, child)
 
 func _cmd_set_main_scene(params: Dictionary) -> Dictionary:
 	if not params.has("path"):
@@ -774,6 +958,14 @@ func _serialize_node(node, owner):
 	var script = node.get_script()
 	if script and script.resource_path != "":
 		data["script"] = script.resource_path
+
+	# CRITICAL: expose scene_file_path so the AI knows this node is a PackedScene
+	# instance. Any node with is_instance=true MUST be edited via open_scene(), not
+	# by adding children to it in the current scene (which causes Load Errors).
+	var src_scene = _scene_file_path_of(node)
+	if src_scene != "":
+		data["is_instance"] = true
+		data["scene_file_path"] = src_scene
 
 	for child in node.get_children():
 		data["children"].append(_serialize_node(child, owner))

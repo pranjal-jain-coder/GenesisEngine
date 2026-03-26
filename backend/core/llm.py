@@ -23,6 +23,12 @@ def _is_timeout(e: Exception) -> bool:
     msg = str(e).lower()
     return any(k in msg for k in ("timeout", "timed out", "deadline exceeded"))
 
+
+def _is_server_error(e: Exception) -> bool:
+    """Return True if the exception represents a 5xx server-side error."""
+    msg = str(e).lower()
+    return any(k in msg for k in ("500", "503", "internal server error", "service unavailable", "overloaded"))
+
 class LLMProvider(ABC):
     """Abstract base class for LLM providers."""
     
@@ -50,17 +56,17 @@ class LLMProvider(ABC):
 class GeminiProvider(LLMProvider):
     """Gemini implementation of the LLM provider with key rotation."""
     
-    def __init__(self):
+    def __init__(self, model_name: str = None):
         # We check for keys dynamically in _get_model
         if not config.get_gemini_keys():
             raise ValueError("No Gemini API keys found in configuration (GEMINI_API_KEY or GEMINI_API_KEYS).")
-        
+
         self.tracker = UsageTracker(
             config.GEMINI_USAGE_PATH,
             config.GEMINI_DAILY_LIMIT,
             rate_limit=config.GEMINI_RATE_LIMIT,
         )
-        self.model_name = config.GEMINI_MODEL
+        self.model_name = model_name or config.GEMINI_MODEL
         self.max_tokens = 8192
 
     def _handle_limit_error(self, error_msg: str, api_key: str):
@@ -135,6 +141,11 @@ class GeminiProvider(LLMProvider):
                 elif _is_timeout(e):
                     logger.warning("Gemini generate timed out. Retrying...")
                     continue
+                elif _is_server_error(e):
+                    wait = 5 * (attempt + 1)
+                    logger.warning(f"Gemini generate server error (5xx). Retrying in {wait}s...")
+                    time.sleep(wait)
+                    continue
                 else:
                     logger.error(f"Error generating content with Gemini: {e}")
                     raise e
@@ -184,6 +195,11 @@ Do not include any markdown formatting, code blocks, or explanations. Return onl
                     continue
                 elif _is_timeout(e):
                     logger.warning("Gemini generate_structured timed out. Retrying...")
+                    continue
+                elif _is_server_error(e):
+                    wait = 5 * (attempt + 1)
+                    logger.warning(f"Gemini generate_structured server error (5xx). Retrying in {wait}s...")
+                    time.sleep(wait)
                     continue
 
                 logger.warning(f"Error in structured generation attempt {attempt + 1}/{max_retries}: {e}")
@@ -243,6 +259,12 @@ Do not include any markdown formatting, code blocks, or explanations. Return onl
                     self._handle_limit_error(response.text or "Rate limit/Quota exceeded", api_key)
                     continue
 
+                if response.status_code >= 500:
+                    wait = 5 * (attempt + 1)
+                    logger.warning(f"Gemini API server error {response.status_code}. Retrying in {wait}s...")
+                    time.sleep(wait)
+                    continue
+
                 if not response.ok:
                     logger.error(f"Gemini API Error {response.status_code}: {response.text}")
                 response.raise_for_status()
@@ -266,6 +288,11 @@ Do not include any markdown formatting, code blocks, or explanations. Return onl
                     continue
                 elif _is_timeout(e):
                     logger.warning("Gemini generate_with_tools timed out. Retrying...")
+                    continue
+                elif _is_server_error(e):
+                    wait = 5 * (attempt + 1)
+                    logger.warning(f"Gemini generate_with_tools server error (5xx). Retrying in {wait}s...")
+                    time.sleep(wait)
                     continue
 
                 logger.error(f"Error in generate_with_tools: {e}", exc_info=True)
@@ -577,13 +604,13 @@ def _proto_value_to_python(value) -> Any:
 
 class LLMFactory:
     """Factory for creating LLM provider instances."""
-    
+
     @staticmethod
-    def get_provider() -> LLMProvider:
+    def get_provider(model_name: str = None) -> LLMProvider:
         provider_name = config.LLM_PROVIDER.lower()
-        
+
         if provider_name == "gemini":
-            return GeminiProvider()
+            return GeminiProvider(model_name=model_name)
         elif provider_name == "openai":
             # Placeholder for OpenAI implementation
             raise NotImplementedError("OpenAI provider is not yet implemented.")

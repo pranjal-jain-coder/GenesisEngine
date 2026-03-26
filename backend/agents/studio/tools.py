@@ -76,15 +76,40 @@ class GodotInterface:
                 "root_type": root_type
             }
         }
-        
+
         try:
             result = await self.manager.send_command(project_path, payload)
             if result.get("success"):
-                return result.get("message", f"Successfully created scene {scene_path}")
+                msg = result.get("message", f"Successfully created scene {scene_path}")
+                scene_tree = result.get("scene_tree")
+                if scene_tree:
+                    return (
+                        f"{msg}\n\n"
+                        f"Scene contents (current state — do NOT recreate these nodes):\n"
+                        f"{json.dumps(scene_tree)}"
+                    )
+                return msg
             else:
                 return f"Failed: {result.get('message', 'Unknown error')}"
         except Exception as e:
             return f"Error create_scene: {str(e)}"
+
+    async def delete_node(self, project_path: str, node_path: str) -> str:
+        """
+        Permanently removes a node and all its children from the currently open scene.
+        """
+        payload = {
+            "method": "delete_node",
+            "params": {"node_path": node_path}
+        }
+        try:
+            result = await self.manager.send_command(project_path, payload)
+            if result.get("success"):
+                return result.get("message", f"Deleted node {node_path}")
+            else:
+                return f"Failed: {result.get('message', 'Unknown error')}"
+        except Exception as e:
+            return f"Error delete_node: {str(e)}"
 
     async def add_node(self, project_path: str, parent_path: str, node_type: str, node_name: str) -> str:
         """
@@ -165,7 +190,7 @@ class GodotInterface:
             result = await self.manager.send_command(project_path, payload)
             if result.get("success"):
                 scene_tree = result.get("scene_tree", {})
-                return json.dumps(scene_tree, indent=2)
+                return json.dumps(scene_tree)
             else:
                 return f"Failed: {result.get('message', 'Unknown error')}"
         except Exception as e:
@@ -191,12 +216,22 @@ class GodotInterface:
         """
         Opens an existing scene in the Godot Editor so it becomes the
         edited scene for subsequent add_node / set_property commands.
+        The response includes the scene tree serialized in the same Godot frame
+        as the open call — no timing race, no stale data.
         """
         payload = {"method": "open_scene", "params": {"path": scene_path}}
         try:
             result = await self.manager.send_command(project_path, payload)
             if result.get("success"):
-                return result.get("message", f"Opened scene {scene_path}")
+                open_msg = result.get("message", f"Opened scene {scene_path}")
+                scene_tree = result.get("scene_tree")
+                if scene_tree:
+                    return (
+                        f"{open_msg}\n\n"
+                        f"Scene contents (nodes that ALREADY EXIST — do NOT add these again):\n"
+                        f"{json.dumps(scene_tree)}"
+                    )
+                return open_msg
             else:
                 return f"Failed: {result.get('message', 'Unknown error')}"
         except Exception as e:
@@ -219,7 +254,15 @@ class GodotInterface:
         try:
             result = await self.manager.send_command(project_path, payload)
             if result.get("success"):
-                return result.get("message", f"Instanced {scene_path}")
+                msg = result.get("message", f"Instanced {scene_path}")
+                instance_tree = result.get("instance_tree")
+                if instance_tree:
+                    return (
+                        f"{msg}\n\n"
+                        f"Nodes inside this instance (from its source scene — do NOT add these to the current scene):\n"
+                        f"{json.dumps(instance_tree)}"
+                    )
+                return msg
             else:
                 return f"Failed: {result.get('message', 'Unknown error')}"
         except Exception as e:
@@ -313,7 +356,7 @@ class GodotInterface:
             result = await self.manager.send_command(project_path, payload)
             if result.get("success"):
                 files = result.get("files", [])
-                return json.dumps(files, indent=2)
+                return json.dumps(files)
             else:
                 return f"Failed: {result.get('message', 'Unknown error')}"
         except Exception as e:
@@ -328,7 +371,7 @@ class GodotInterface:
         try:
             result = await self.manager.send_command(project_path, payload)
             if result.get("success"):
-                return json.dumps(result.get("input_map", {}), indent=2)
+                return json.dumps(result.get("input_map", {}))
             else:
                 return f"Failed: {result.get('message', 'Unknown error')}"
         except Exception as e:
@@ -519,7 +562,7 @@ class AssetInterface:
         )
         service = self._get_service(project_path)
         result = await service.get_sprite(request)
-        return result.model_dump_json(indent=2)
+        return result.model_dump_json()
 
     async def get_sprite_options(
         self,
@@ -633,7 +676,7 @@ class AssetInterface:
         )
         service = self._get_service(project_path)
         result = await service.get_sprite(request)
-        return result.model_dump_json(indent=2)
+        return result.model_dump_json()
 
     async def get_tileset(
         self,
@@ -686,7 +729,7 @@ class AssetInterface:
         )
         service = self._get_service(project_path)
         result = await service.get_tileset(request)
-        return result.model_dump_json(indent=2)
+        return result.model_dump_json()
 
     async def get_background(
         self,
@@ -732,7 +775,7 @@ class AssetInterface:
         )
         service = self._get_service(project_path)
         result = await service.get_background(request)
-        return result.model_dump_json(indent=2)
+        return result.model_dump_json()
 
     async def get_audio(
         self,
@@ -771,7 +814,7 @@ class AssetInterface:
         )
         service = self._get_service(project_path)
         result = await service.get_audio(request)
-        return result.model_dump_json(indent=2)
+        return result.model_dump_json()
 
 
 def _sync_placeholder(*args, **kwargs):

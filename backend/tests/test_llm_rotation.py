@@ -74,12 +74,24 @@ class TestGeminiRotation(unittest.TestCase):
         result = provider.generate("test")
         
         self.assertEqual(result, "success")
-        # Ensure it marked key1 as exhausted and tried key2
+        # Ensure ambiguous 429 did NOT mark key1 daily-exhausted and key2 succeeded.
         with open(self.usage_path, 'r') as f:
             data = json.load(f)
             today = list(data.keys())[0]
-            self.assertEqual(data[today]["key1"], 2) # Limit is 2
             self.assertEqual(data[today]["key2"], 1)
+            self.assertNotIn("key1", data[today])
+
+    def test_explicit_daily_quota_error_marks_exhausted(self):
+        provider = GeminiProvider()
+        provider._handle_limit_error(
+            "Quota exceeded for quota metric 'Generate content requests per day'",
+            "key1",
+        )
+
+        with open(self.usage_path, 'r') as f:
+            data = json.load(f)
+            today = list(data.keys())[0]
+            self.assertEqual(data[today]["key1"], 2)  # Limit is 2
 
 if __name__ == "__main__":
     unittest.main()

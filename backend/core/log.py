@@ -19,6 +19,8 @@ console = Console(
     }),
 )
 
+logger = logging.getLogger("GenesisEngine.llm")
+
 
 def setup_logging():
     """Configure Rich logging handler for the entire application."""
@@ -50,20 +52,16 @@ def setup_logging():
 # ---------------------------------------------------------------------------
 
 def log_llm_start(caller: str, mode: str = "generate"):
-    """Print a visual indicator that an LLM call is starting."""
-    icons = {
-        "generate":            "🤖",
-        "generate_structured": "📋",
-        "generate_with_tools": "🛠️ ",
-    }
-    icon = icons.get(mode, "🤖")
-    console.print(f"  {icon} [cyan]{mode}[/cyan]  ←  [dim]{caller}[/dim]")
+    """Log that an LLM call has been initiated."""
+    logger.debug("LLM %s call initiated for %s", mode, caller)
 
 
 def log_llm_done(caller: str, mode: str = "generate", elapsed: float = None):
-    """Print a visual indicator that an LLM call completed."""
-    timing = f"  [dim]({elapsed:.1f}s)[/dim]" if elapsed is not None else ""
-    console.print(f"  ✓  [cyan]{mode} done[/cyan]{timing}  ←  [dim]{caller}[/dim]")
+    """Log the completion of an LLM call along with its duration."""
+    if elapsed is not None:
+        logger.info("LLM %s call for %s completed in %.1fs", mode, caller, elapsed)
+    else:
+        logger.info("LLM %s call for %s completed", mode, caller)
 
 
 def log_node_start(node_name: str, task: str = ""):

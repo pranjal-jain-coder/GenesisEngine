@@ -34,7 +34,11 @@ class Config:
     
     # LLM Settings
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "gemini")
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+    # Orchestration model: supervisor, reviewer, task generation (more capable)
+    GEMINI_MODEL_FLASH: str = os.getenv("GEMINI_MODEL_FLASH", "gemini-3-flash-preview")
+    # Execution model: coder node, GDD designer conversation (faster/cheaper)
+    GEMINI_MODEL_LITE: str = os.getenv("GEMINI_MODEL_LITE", "gemini-3.1-flash-lite-preview")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")  # backwards compat
 
     # Image Generation Settings
     IMAGE_PROVIDER: str = os.getenv("IMAGE_PROVIDER", "local")

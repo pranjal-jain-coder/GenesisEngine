@@ -142,8 +142,9 @@ class ArchitectAgent:
     # (to handle consecutive tool calls without infinite loops)
     MAX_TOOL_DEPTH = 3
 
-    def __init__(self, llm_provider: LLMProvider):
-        self.llm = llm_provider
+    def __init__(self, llm_designer: LLMProvider, llm_task_generator: LLMProvider):
+        self.llm = llm_designer           # GDD conversation (lite model)
+        self.llm_task = llm_task_generator  # task generation (flash model)
         self.state = AgentState.IDLE
         self.history: List[Dict[str, Any]] = []   # Gemini-format history
         self.current_gdd: Optional[GameDesignDocument] = None
@@ -506,47 +507,71 @@ class ArchitectAgent:
 
     async def generate_tasks(self, gdd: GameDesignDocument, project_path: str = None) -> List[Task]:
         """Generate a list of actionable tasks from the GDD."""
+        if project_path:
+            from services.git_manager import GitManager
+            GitManager.commit_state(project_path, "GDD finalized, starting task generation")
+
         logger.info("Generating task list from GDD...")
 
-        prompt = f"""You are a Technical Lead for a Godot 4 game development project.
+        prompt = f"""You are a game designer writing a production task list for a development team.
 
-Based on the following Game Design Document:
+GDD:
 {gdd.to_json()}
 
-Pay special attention to `detailed_systems` and `mechanics` — use their `implementation_guide` and `description` fields to make task descriptions technically specific.
+Create a complete task list. Each task is the ONLY document the developer reads — they have no GDD access and will not infer or invent anything not written. If something is not written in the task, it will NOT be implemented.
 
-Create an implementation plan of 5-12 tasks (use fewer tasks for simpler games, more for complex ones). Follow these STRICT rules:
-## RULE 1: Task Ordering
-- The FIRST task must ALWAYS be project setup: configure window size (1280×720), pixel art renderer (Nearest filter), create main scene, set Camera2D zoom.
-- Build incrementally — each block of 1-3 tasks adds one meaningful layer (movement, enemies, UI, etc.).
-- Core systems come before polish. Assets (sprites) come before the scenes that use them.
+## CARDINAL RULE
+**If you don't write it, it doesn't exist.**
+- Every interaction between two objects must be stated explicitly.
+- Every mechanic must be fully defined: what triggers it, what changes, by how much, and all visual/audio feedback.
+- Never write "standard behavior", "as expected", "appropriate response", or "etc." — spell it out completely.
+- Never assume a prior task's system handles something implicitly — re-state every relevant connection.
+- Consider each and every object that has been or will be created and its interactions with all other objects.
 
-## RULE 2: Task Descriptions and Asset Handling
-- Each task should represent roughly 1 focused feature or scene. Combine trivial steps into a single task so unnecessary tasks are not created. Be conservative but meaningful with task generation.
-- EVERY task MUST produce a testable result. At the end of EVERY task description, describe exactly what the developer can see, do, or test in Godot to validate the state at the end of that task.
-- Task descriptions should read like actual natural language tasks or objectives, NOT as dense code snippets or raw pseudocode.
-- Provide clear guidance on what the AI needs to build, mentioning key technical details (like file paths or root node types) naturally.
-- **Specific Emphasis on Asset Handling**: Whenever visuals or sounds are needed, clearly instruct the AI to acquire the assets first (e.g., "Use the asset tools to generate a player sprite"). Then, explicitly instruct the AI to ensure the acquired assets are properly attached to their respective nodes (like Sprite2D) via code. For example: "Retrieve a pixel-art enemy sprite, then build the enemy scene, making sure to load and assign the new texture to the enemy's Sprite2D node."
+## GUIDELINES
 
-## RULE 3: First Task is Always Project Setup
-The first task description must instruct the AI to configure the project settings optimally for 2D. It should mention setting the viewport to 1280×720, the texture filter to Nearest, and the renderer to gl_compatibility, followed by creating the main scene with a Camera2D and setting it as the main run scene.
+1. **Scope**: Each task covers a meaningful, self-contained piece of gameplay. Not a single object in isolation, not the entire game at once. Avoid doing too many things in a single task, and prefer focusing on one aspect in greater detail.
 
-## EXAMPLE STRUCTURE (for a pixel art platformer):
-1. TASK-01: Configure the core project settings for a pixel art game. Use a Godot script to set the viewport to 1280x720, enable the Nearest texture filter, and set the renderer to gl_compatibility. Create 'res://scenes/main.tscn' (Node2D root) with a Camera2D zoomed to (2,2), and set it as the main scene. 🎮 End State: A blank main scene opens correctly when the game is played.
-2. TASK-02: Implement the basic Player character. First, use the appropriate tool to acquire a 32x64 pixel art hero sprite. Create a new 'res://scenes/player.tscn' scene using CharacterBody2D, adding a Sprite2D and a Capsule CollisionShape2D. Write a player script to handle left/right movement and jumping. Crucially, ensure the script loads the acquired sprite texture and assigns it to the Sprite2D node. Attach the script and save the scene. Instance the player into the main scene. 🎮 End State: The player character is visible in the main scene, the imported sprite is fully visible and correctly attached, and falls downwards smoothly.
-3. TASK-03: Create a static platform block. Acquire a 32x32 stone block sprite. Create 'res://scenes/platform.tscn' (StaticBody2D). Add Sprite2D and CollisionShape2D (RectangleShape2D). Load the block logic. Instance a floor out of these blocks in the main scene. 🎮 End State: The player spawns, falls, and successfully lands and stops on the platforms. Can move left/right and jump over them.
-... and so on.
+2. **Full behavior spec for every object**: For each object introduced or modified in the task, define:
+   - **Trigger**: what causes it to act (which key is pressed, what it collides with, what timer fires, what condition is met)
+   - **Action**: exactly what it does (moves, fires, disappears, changes a value)
+   - **Effect on others**: every other object affected and exactly how (loses N health, score increases by N, screen transitions, object disappears)
+   - **Visual feedback**: describe what the player sees — color, duration, animation name, size change. E.g. "the player flashes red for 0.3 seconds, then returns to normal"
+   - **Audio feedback**: what sound plays, when, and roughly what it sounds like
 
-## OUTPUT FORMAT
-Return a JSON object with a "tasks" key containing the list of Task objects.
-Each Task must have:
-- 'id': unique string ("TASK-XX")
-- 'description': string — MUST read as a natural language objective with explicit asset attachment instructions, necessary technical details, and end state test validation.
+3. **Cross-system interactions**: Whenever an object interacts with something from a previous task, re-state it in full. E.g. "when a player bullet (introduced in TASK-01) contacts this enemy, the enemy loses 1 HP and disappears; the bullet also disappears; the score (from TASK-01) increases by 10". Never assume the developer connects these dots.
+
+4. **Assets**: Acquire visual and audio assets at the moment they are first needed. No placeholders or "add a sprite later". Describe the desired look precisely: style, colors, rough size, orientation. E.g. "a small bright-red pixel-art spaceship facing upward, roughly 64×64 pixels".
+
+5. **Scene organisation**: Explicitly mention the creation of a main scene. State which logical scene each object belongs to (e.g. player scene, enemy scene, main scene). Keep player, enemies, projectiles, and UI in separate scenes, each instanced into the main scene. Say explicitly when a sub-scene is placed into the main scene. State when a temporary or placeholder object should be removed.
+
+6. **Concrete values**: Give real numbers — movement speed, damage amounts, health totals, spawn intervals, cooldown durations, score increments. The developer must not guess.
+
+7. **Completeness**: Before finalising the task list, check every mechanic, enemy type, item, UI element, win condition, and lose condition from the GDD is covered in at least one task. Add tasks for anything missing.
+
+8. **Done condition**: End every task with "✓ Done when:" followed by exactly what the developer will observe in-game when the task is fully and correctly complete.
+
+## ANTI-PATTERNS — never write these
+- "The enemy behaves as expected" → say exactly what it does
+- "Handle the collision appropriately" → say what each collision causes
+- "Add standard UI" → list every element, what value it shows, where on screen it sits
+- "The player takes damage when hit" → say how much, describe the flash/feedback, state if there are invincibility frames and for how long
+- "Enemies pursue the player" → say at what speed, whether they accelerate, what happens when they reach the player
+- Any Godot node names (CharacterBody2D, Area2D, etc.) or function names (queue_free, set_property, etc.) — describe behavior only, not implementation
+
+## EXAMPLE TASK (good)
+TASK-02: **Basic Enemies**
+Acquire a pixel-art enemy sprite: a green alien saucer facing downward, roughly 48×48 pixels. The enemy lives in its own scene. A new enemy appears at a random horizontal position along the top edge of the screen every 3 seconds. The enemy moves straight downward at 120 pixels per second. If the enemy reaches the bottom edge of the screen it disappears silently. When a player bullet (from TASK-01) touches the enemy: the enemy flashes white for 0.1 seconds then disappears; the bullet disappears; a short high-pitched "pop" sound plays; the score counter (from TASK-01) increases by 10. When the enemy touches the player (from TASK-01): the player flashes red for 0.3 seconds; the player loses 1 life; the life counter in the HUD (from TASK-01) decreases by 1 immediately; the enemy disappears; if lives reach 0 the game over screen appears (from TASK-01). ✓ Done when: enemies spawn at the top, move down, are destroyed by player bullets with score updating, and reduce player lives on contact.
+
+## OUTPUT
+JSON object with "tasks" key:
+- 'id': "TASK-01", "TASK-02", ...
+- 'description': Full specification as described above. No Godot node or function names.
 - 'status': "PENDING"
 """
-        console.print("\n  [bold green]📋 Generating task list from GDD…[/bold green]")
+        console.print("\n[bold green]📋 Generating task list from GDD…[/bold green]")
         try:
-            task_list_obj = self.llm.generate_structured(prompt, TaskList)
+            task_list_obj = self.llm_task.generate_structured(prompt, TaskList)
             self.tasks = task_list_obj.tasks
             self.current_task_index = 0
 
@@ -570,27 +595,65 @@ Each Task must have:
 
         logger.info(f"Regenerating tasks with feedback: {feedback}")
 
-        prompt = f"""You are a Technical Lead adapting a Godot 4 game implementation plan based on user feedback.
+        prompt = f"""You are a game designer revising a production task list.
 
-Completed Tasks (do NOT change these):
+Completed tasks (already built — do not redo these):
 {[t.description for t in completed_tasks]}
 
-Remaining Tasks (to be revised based on feedback):
+Remaining tasks (being replaced):
 {[t.description for t in remaining_tasks]}
 
-User Feedback: "{feedback}"
+Feedback: "{feedback}"
 
-Generate a NEW list of remaining tasks that incorporates the feedback. Target a total plan size of 5-12 tasks; with {len(completed_tasks)} already completed, aim for roughly {max(1, 5 - len(completed_tasks))}-{max(1, 12 - len(completed_tasks))} more tasks. Combine trivial steps into single tasks where necessary.
+Generate a NEW list of remaining tasks that incorporates the feedback. You are NOT restricted to a specific number.
 
-## STRICT RULES (same as original plan):
-1. Keep tasks granular but ensure unnecessary tasks are not created. Tasks must read as natural language objectives, not raw code. ALWAYS emphasize generating assets first and properly attaching them to sprites.
-2. EVERY task MUST produce a testable result. At the end of EVERY task description, describe exactly what the developer can see, do, or test in Godot to validate the state at the end of that task.
+## CARDINAL RULE
+**If you don't write it, it doesn't exist.**
+- Every interaction between two objects must be stated explicitly.
+- Every mechanic must be fully defined: what triggers it, what changes, by how much, and all visual/audio feedback.
+- Never write "standard behavior", "as expected", "appropriate response", or "etc." — spell it out completely.
+- Never assume a prior task's system handles something implicitly — re-state every relevant connection.
+- Consider each and every object that has been or will be created and its interactions with all other objects.
 
-Return a JSON object with a "tasks" key containing the list of Task objects.
-Each Task must have: 'id' (string "TASK-XX"), 'description' (string), 'status' ("PENDING").
+## GUIDELINES
+
+1. **Scope**: Each task covers a meaningful, self-contained piece of gameplay. Not a single object in isolation, not the entire game at once. Avoid doing too many things in a single task, and prefer focusing on one aspect in greater detail.
+
+2. **Full behavior spec for every object**: For each object introduced or modified, define:
+   - **Trigger**: what causes it to act (which key is pressed, what it collides with, what timer fires, what condition is met)
+   - **Action**: exactly what it does (moves, fires, disappears, changes a value)
+   - **Effect on others**: every other object affected and exactly how (loses N health, score +N, screen changes, object disappears)
+   - **Visual feedback**: describe what the player sees — color, duration, animation name, size change. E.g. "flashes red for 0.3 seconds then returns to normal"
+   - **Audio feedback**: what sound plays, when, and roughly what it sounds like
+
+3. **Cross-system interactions**: Whenever an object interacts with something from a completed task, re-state it in full. E.g. "when a player bullet (introduced in TASK-01) contacts this enemy, the enemy loses 1 HP and disappears; the bullet also disappears; the score (from TASK-01) increases by 10". Never assume the developer connects these dots.
+
+4. **Assets**: Acquire visual and audio assets at the moment they are first needed. No placeholders or "add a sprite later". Describe the desired look precisely: style, colors, rough size, orientation. E.g. "a small bright-red pixel-art spaceship facing upward, roughly 64×64 pixels".
+
+5. **Scene organisation**: Explicitly mention the creation of a main scene if not yet built. State which logical scene each object belongs to (e.g. player scene, enemy scene, main scene). Keep player, enemies, projectiles, and UI in separate scenes, each instanced into the main scene. Say explicitly when a sub-scene is placed into the main scene. State when a temporary or placeholder object should be removed.
+
+6. **Concrete values**: Give real numbers — movement speed, damage amounts, health totals, spawn intervals, cooldown durations, score increments. The developer must not guess.
+
+7. **Completeness**: Verify that every mechanic and feature implied by the feedback is covered in the new tasks, and that nothing already built by the completed tasks is broken or contradicted.
+
+8. **Done condition**: End every task with "✓ Done when:" followed by exactly what the developer will observe in-game when the task is fully and correctly complete.
+
+## ANTI-PATTERNS — never write these
+- "The enemy behaves as expected" → say exactly what it does
+- "Handle the collision appropriately" → say what each collision causes
+- "Add standard UI" → list every element, what value it shows, where on screen it sits
+- "The player takes damage when hit" → say how much, describe the flash/feedback, state if there are invincibility frames and for how long
+- "Enemies pursue the player" → say at what speed, whether they accelerate, what happens when they reach the player
+- Any Godot node names (CharacterBody2D, Area2D, etc.) or function names (queue_free, set_property, etc.) — describe behavior only, not implementation
+
+## OUTPUT
+JSON object with "tasks" key:
+- 'id': continue numbering from completed tasks (e.g. "TASK-04" if 3 are done)
+- 'description': Full specification as described above. No Godot node or function names.
+- 'status': "PENDING"
 """
         try:
-            new_task_list_obj = self.llm.generate_structured(prompt, TaskList)
+            new_task_list_obj = self.llm_task.generate_structured(prompt, TaskList)
             self.tasks = completed_tasks + new_task_list_obj.tasks
 
             if project_path:

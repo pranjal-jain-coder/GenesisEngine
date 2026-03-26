@@ -84,6 +84,12 @@ def create_coder_wrapper(godot_interface: GodotInterface, asset_interface: Asset
         return result
     return coder_wrapper
 
+def create_supervisor_wrapper(godot_interface: GodotInterface):
+    """Creates a wrapper for the supervisor node that includes the GodotInterface."""
+    async def supervisor_wrapper(state: StudioState) -> Dict:
+        return await supervisor_node(state, godot_interface)
+    return supervisor_wrapper
+
 def compile_graph(connection_manager: ConnectionManager):
     """
     Compiles and returns the Studio Agent workflow graph.
@@ -104,7 +110,7 @@ def compile_graph(connection_manager: ConnectionManager):
     workflow = StateGraph(StudioState)
     
     # Add nodes
-    workflow.add_node("supervisor", supervisor_node)
+    workflow.add_node("supervisor", create_supervisor_wrapper(godot_interface))
     workflow.add_node("coder", create_coder_wrapper(godot_interface, asset_interface))
     workflow.add_node("reviewer", reviewer_node)
     workflow.add_node("human_review", human_review_node)

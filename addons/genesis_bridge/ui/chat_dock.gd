@@ -22,6 +22,7 @@ var loading_timer: Timer = null
 var loading_dots: int = 0
 var execution_status_label: Label = null
 var execution_loading_base_text: String = ""
+var current_executing_task_id: String = "" # Track active task for reconnection
 
 # Tracks the current pending asset review so feedback / option selection can be sent
 var pending_asset_review: Dictionary = {}
@@ -179,6 +180,17 @@ func _build_ui() -> void:
 	execution_status_label.add_theme_color_override("font_color", Color.LIGHT_GREEN)
 	status_hbox.add_child(execution_status_label)
 	
+	var cancel_btn = Button.new()
+	cancel_btn.text = "×"
+	cancel_btn.tooltip_text = "Force Stop"
+	cancel_btn.flat = true
+	cancel_btn.focus_mode = Control.FOCUS_NONE
+	cancel_btn.pressed.connect(func(): 
+		_set_execution_busy(false)
+		add_system_message("Execution forcibly stopped.")
+	)
+	status_hbox.add_child(cancel_btn)
+	
 	loading_container.visible = false
 	execution_status_label.set_meta("container", loading_container)
 
@@ -196,6 +208,33 @@ func set_bridge_client(client: Node) -> void:
 		# Connect to bridge client signals if available
 		if bridge_client.has_signal("message_received"):
 			bridge_client.message_received.connect(_on_message_received)
+		if bridge_client.has_signal("connection_changed"):
+			bridge_client.connection_changed.connect(_on_connection_changed)
+
+func _on_connection_changed(connected: bool) -> void:
+	if not connected:
+		# Do NOT hide busy UI immediately on disconnect. Wait for reconnection to sync state.
+		# Only force reset if the user clicks manual Cancel.
+		add_system_message("Disconnected from backend. Waiting for reconnection...")
+	else:
+		add_system_message("Connected to backend.")
+		if bridge_client and bridge_client.has_method("send_message"):
+			add_system_message("Syncing project state...")
+			bridge_client.send_message({
+				"type": "chat",
+				"mode": "execution",
+				"action": "get_project_state"
+			})
+		# If we were in the middle of a task, ask backend for status
+		if current_executing_task_id != "":
+			if bridge_client and bridge_client.has_method("send_message"):
+				add_system_message("Syncing task status...")
+				bridge_client.send_message({
+					"type": "chat",
+					"mode": "execution",
+					"action": "check_task_status",
+					"task_id": current_executing_task_id
+				})
 
 func _on_send_pressed() -> void:
 	_send_message()
@@ -490,7 +529,8 @@ func _add_message(sender: String, text: String, color: Color) -> void:
 
 func _on_message_received(message: Dictionary) -> void:
 	# Handle incoming messages from backend
-	var type = message.get("type")
+	var type = message.get("type", "unknown")
+	print("ChatDock: Received message type: %s" % type)
 	
 	if type == "chat_response":
 		# Legacy / Planning mode
@@ -504,7 +544,9 @@ func _on_message_received(message: Dictionary) -> void:
 			add_error_message(message["error"])
 			
 	elif type == "task_list":
-		_set_execution_busy(false)
+		# Only clear busy if we aren't waiting for a task completion
+		if current_executing_task_id == "":
+			_set_execution_busy(false)
 		var task_array = message.get("tasks", [])
 		_update_task_list(task_array)
 		
@@ -514,10 +556,12 @@ func _on_message_received(message: Dictionary) -> void:
 			_on_mode_changed(1)
 		
 	elif type == "task_started":
+		current_executing_task_id = message.get("task_id", "")
 		# Could highlight specific task
 		pass
 		
 	elif type == "task_completed":
+		current_executing_task_id = ""
 		_set_execution_busy(false)
 		_update_task_list(message.get("tasks", []))
 		# Rescan filesystem and reload the open scene so the editor reflects
@@ -538,6 +582,7 @@ func _on_message_received(message: Dictionary) -> void:
 				)
 
 	elif type == "error":
+		current_executing_task_id = ""
 		_set_execution_busy(false)
 		add_error_message(message.get("content", "Unknown Error"))
 		
@@ -573,9 +618,13 @@ func _on_message_received(message: Dictionary) -> void:
 		pending_asset_review = message
 		_show_asset_review_dialog(message)
 		
-	elif type == "task_verification_request":
-		_set_execution_busy(false)
-		_show_verification_dialog(message)
+	elif type == "status":
+		# Status update from backend studio agent
+		if execution_status_label and execution_status_label.is_visible_in_tree():
+			execution_loading_base_text = message.get("content", "Working...")
+			execution_status_label.text = execution_loading_base_text
+		else:
+			add_system_message(message.get("content", ""))
 
 	elif type == "log":
 		# Live asset pipeline logs and system status
@@ -883,130 +932,3 @@ func _send_asset_feedback(task_id: String, feedback: String, selected_index: int
 	if selected_index >= 0:
 		payload["selected_index"] = selected_index
 	bridge_client.send_message(payload)
-
-func _show_verification_dialog(data: Dictionary) -> void:
-	"""Show a popup dialog asking the user to verify a task."""
-	var task_id = data.get("task_id", "")
-	var content = data.get("content", "Task finished. Please verify.")
-	
-	var dialog = ConfirmationDialog.new()
-	dialog.title = "Verify Task"
-	dialog.ok_button_text = "Task Verified & Working"
-	dialog.cancel_button_text = "Report Issue"
-	dialog.min_size = Vector2(400, 200)
-	
-	var vbox = VBoxContainer.new()
-	dialog.add_child(vbox)
-	
-	var msg_label = Label.new()
-	msg_label.text = content
-	msg_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	vbox.add_child(msg_label)
-	
-	var feedback_input = LineEdit.new()
-	feedback_input.placeholder_text = "If something is wrong, describe it here..."
-	feedback_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	feedback_input.visible = false
-	vbox.add_child(feedback_input)
-	
-	# Logic to handle verification flow
-	# Since ConfirmationDialog only has OK/Cancel, we hijack Cancel for "Report Issue"
-	# To do this cleanly, we need a custom dialog or careful signal handling.
-	# Let's switch to a custom Window for better control similar to asset review.
-	dialog.queue_free()
-	
-	var win = Window.new()
-	win.title = "Verify Task Execution"
-	win.min_size = Vector2(500, 250)
-	win.always_on_top = true
-	EditorInterface.get_base_control().add_child(win)
-	
-	var margin = MarginContainer.new()
-	margin.set_anchors_preset(Control.PRESET_FULL_RECT)
-	margin.add_theme_constant_override("margin_left", 20)
-	margin.add_theme_constant_override("margin_right", 20)
-	margin.add_theme_constant_override("margin_top", 20)
-	margin.add_theme_constant_override("margin_bottom", 20)
-	win.add_child(margin)
-	
-	var layout = VBoxContainer.new()
-	margin.add_child(layout)
-	
-	var header = Label.new()
-	header.text = "Task Execution Finished"
-	header.add_theme_font_size_override("font_size", 18)
-	layout.add_child(header)
-	
-	var desc = Label.new()
-	desc.text = content
-	desc.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	desc.custom_minimum_size.y = 60
-	layout.add_child(desc)
-	
-	layout.add_child(HSeparator.new())
-	
-	var q_label = Label.new()
-	q_label.text = "Does the game work as expected?"
-	layout.add_child(q_label)
-	
-	var btn_row = HBoxContainer.new()
-	layout.add_child(btn_row)
-	
-	var approve_btn = Button.new()
-	approve_btn.text = "✅ Yes, It Works"
-	approve_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	approve_btn.custom_minimum_size.y = 40
-	approve_btn.pressed.connect(func():
-		_send_verification_feedback(task_id, "APPROVED")
-		win.queue_free()
-	)
-	btn_row.add_child(approve_btn)
-	
-	var reject_btn = Button.new()
-	reject_btn.text = "❌ No, Something is Broken"
-	reject_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	btn_row.add_child(reject_btn)
-	
-	# Hidden reporting section
-	var report_box = VBoxContainer.new()
-	report_box.visible = false
-	layout.add_child(report_box)
-	
-	var report_label = Label.new()
-	report_label.text = "Describe the issue (system will prioritize a fix immediately):"
-	report_box.add_child(report_label)
-	
-	var issue_edit = LineEdit.new()
-	issue_edit.custom_minimum_size.y = 35
-	report_box.add_child(issue_edit)
-	
-	var submit_issue_btn = Button.new()
-	submit_issue_btn.text = "Submit Issue & Fix"
-	submit_issue_btn.pressed.connect(func():
-		var issue = issue_edit.text.strip_edges()
-		if issue.is_empty():
-			return
-		_send_verification_feedback(task_id, issue)
-		win.queue_free()
-	)
-	report_box.add_child(submit_issue_btn)
-	
-	reject_btn.pressed.connect(func():
-		btn_row.visible = false
-		report_box.visible = true
-		q_label.text = "What went wrong?"
-	)
-	
-	win.close_requested.connect(func(): win.queue_free())
-	win.popup_centered()
-
-func _send_verification_feedback(task_id: String, feedback: String) -> void:
-	if bridge_client and bridge_client.has_method("send_message"):
-		bridge_client.send_message({
-			"type": "chat",
-			"mode": "execution",
-			"action": "task_verification_feedback",
-			"task_id": task_id,
-			"feedback": feedback
-		})
-		_set_execution_busy(true, "Processing Verification...")

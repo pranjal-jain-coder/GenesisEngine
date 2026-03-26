@@ -116,6 +116,7 @@ class AssetGenerator:
                     # removal to their output would corrupt purple/pink sprite pixels.
                     if config.IMAGE_PROVIDER == "local":
                         img = self._remove_chroma_key_background(img)
+                        img = self._decontaminate_alpha_edges(img, matte_color=(255, 0, 255))
                     # Flood fill from corners to remove any solid background
                     img = self._flood_fill_remove_background(img)
                     # Isolate the main sprite to remove small artifacts
@@ -263,6 +264,7 @@ class AssetGenerator:
                     # this to their output would corrupt any pink/purple/magenta tile pixels.
                     if config.IMAGE_PROVIDER == "local":
                         img = self._remove_chroma_key_background(img)
+                        img = self._decontaminate_alpha_edges(img, matte_color=(255, 0, 255))
 
                     # Resize to exact tileset dimensions to ensure grid alignment.
                     total_w = tile_size * columns
@@ -431,6 +433,48 @@ class AssetGenerator:
                 new_data.append(item)
 
         img.putdata(new_data)
+        return img
+
+    def _decontaminate_alpha_edges(
+        self,
+        img: Image.Image,
+        matte_color: Tuple[int, int, int] = (255, 0, 255),
+    ) -> Image.Image:
+        """
+        Removes matte color spill from semi-transparent pixels.
+
+        Local SD often anti-aliases sprite edges against the requested magenta
+        background. If we only reduce alpha, residual magenta in RGB can appear as
+        purple/green fringes after engine filtering/compression.
+        """
+        img = img.convert("RGBA")
+        bg_r = matte_color[0] / 255.0
+        bg_g = matte_color[1] / 255.0
+        bg_b = matte_color[2] / 255.0
+
+        cleaned = []
+        for r, g, b, a in img.getdata():
+            if a <= 0:
+                cleaned.append((0, 0, 0, 0))
+                continue
+            if a >= 255:
+                cleaned.append((r, g, b, a))
+                continue
+
+            alpha = a / 255.0
+            inv_alpha = 1.0 - alpha
+
+            # observed = foreground * alpha + matte * (1 - alpha)
+            fg_r = ((r / 255.0) - bg_r * inv_alpha) / alpha
+            fg_g = ((g / 255.0) - bg_g * inv_alpha) / alpha
+            fg_b = ((b / 255.0) - bg_b * inv_alpha) / alpha
+
+            fg_r = max(0.0, min(1.0, fg_r))
+            fg_g = max(0.0, min(1.0, fg_g))
+            fg_b = max(0.0, min(1.0, fg_b))
+            cleaned.append((int(fg_r * 255), int(fg_g * 255), int(fg_b * 255), a))
+
+        img.putdata(cleaned)
         return img
 
     # -----------------------------------------------------------------------

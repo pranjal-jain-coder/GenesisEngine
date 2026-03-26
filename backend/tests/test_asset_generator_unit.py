@@ -94,3 +94,16 @@ def test_chroma_key_removal(generator):
     # Check the edge pixel was soft-blended (alpha > 0 but < 255)
     r, g, b, a = processed.getpixel((6, 6))
     assert a > 0 and a < 255
+
+def test_alpha_edge_decontamination(generator):
+    # Simulate an anti-aliased edge pixel produced over magenta matte:
+    # observed = foreground * alpha + matte * (1 - alpha)
+    img = Image.new("RGBA", (1, 1), (127, 64, 127, 128))
+    processed = generator._decontaminate_alpha_edges(img, matte_color=(255, 0, 255))
+    r, g, b, a = processed.getpixel((0, 0))
+
+    # Expect matte spill to be removed and green foreground to be recovered.
+    assert a == 128
+    assert g > 120
+    assert r < 5
+    assert b < 5

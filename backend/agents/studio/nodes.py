@@ -1,18 +1,134 @@
 import asyncio
 import logging
 import json
-from typing import Dict, List, Optional, Any
+import re
+import time
+from typing import Dict, List, Optional, Any, Set
 from langchain_core.messages import AIMessage
 from agents.studio.state import StudioState
 from agents.studio.tools import GodotInterface, AssetInterface
 from core.llm import LLMFactory
+from core.config import config
 from core.log import log_node_start, log_node_done, log_action_exec, log_asset_acquire
 from services.project_scanner import ProjectScanner
-from services.godot_rag import godot_rag
-from services.project_rag import project_rag
 import google.generativeai as genai
 
+
+# ---------------------------------------------------------------------------
+# .tscn file parser — extracts instanced scenes without Godot bridge calls
+# ---------------------------------------------------------------------------
+
+def _parse_tscn_instances(content: str) -> List[str]:
+    """Return list of res:// scene paths that are instanced inside this .tscn."""
+    # Build id → path map for PackedScene external resources
+    ext_resources: Dict[str, str] = {}
+    for m in re.finditer(r'\[ext_resource[^\]]*\]', content):
+        attrs = m.group(0)
+        id_m = re.search(r'\bid="([^"]+)"', attrs)
+        path_m = re.search(r'\bpath="([^"]+)"', attrs)
+        type_m = re.search(r'\btype="([^"]+)"', attrs)
+        if id_m and path_m and type_m and type_m.group(1) == "PackedScene":
+            ext_resources[id_m.group(1)] = path_m.group(1)
+    # Find all instance= references
+    instances = []
+    for m in re.finditer(r'instance=ExtResource\("([^"]+)"\)', content):
+        res_id = m.group(1)
+        if res_id in ext_resources:
+            instances.append(ext_resources[res_id])
+    return instances
+
+
+def _parse_tscn_nodes(content: str) -> List[str]:
+    """Return list of 'NodeName (NodeType)' for every owned node in this .tscn."""
+    nodes = []
+    for m in re.finditer(r'\[node name="([^"]+)" type="([^"]+)"', content):
+        nodes.append(f"{m.group(1)} ({m.group(2)})")
+    return nodes
+
+
+def _build_tscn_summary(tscn_files: Dict[str, str]) -> str:
+    """
+    Parse all .tscn files and return a human-readable summary listing:
+      - Each scene's own nodes (so the AI knows what already exists before opening it)
+      - Any sub-scenes instanced inside it
+    """
+    lines = []
+
+    for tscn_path, content in tscn_files.items():
+        own_nodes = _parse_tscn_nodes(content)
+        instanced = _parse_tscn_instances(content)
+        parts = []
+        if own_nodes:
+            parts.append(f"nodes: {', '.join(own_nodes)}")
+        if instanced:
+            parts.append(f"instances: {', '.join(instanced)}  ← do NOT instance these again")
+        if parts:
+            lines.append(f"  {tscn_path}  —  {' | '.join(parts)}")
+        else:
+            lines.append(f"  {tscn_path}: (empty)")
+
+    return "\n".join(lines) if lines else "  (no .tscn files found)"
+
 logger = logging.getLogger(__name__)
+
+
+_LLM_STEP_MAX_RETRIES = 4
+_RETRYABLE_HTTP_STATUS = {500, 502, 503, 504}
+
+
+def _extract_http_status(err: Exception) -> Optional[int]:
+    """Best-effort HTTP status extraction from provider exceptions."""
+    msg = str(err)
+    m = re.search(r"\b([45]\d{2})\b", msg)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _is_retryable_llm_error(err: Exception) -> bool:
+    status = _extract_http_status(err)
+    if status in _RETRYABLE_HTTP_STATUS:
+        return True
+    msg = str(err).lower()
+    return any(token in msg for token in (
+        "timeout",
+        "timed out",
+        "deadline exceeded",
+        "internal server error",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "temporarily unavailable",
+        "connection reset",
+    ))
+
+
+async def _run_llm_step_with_retries(step_name: str, llm_call, **kwargs):
+    """
+    Retry transient LLM/API failures for a single node step.
+    This keeps the workflow on the same failed step instead of advancing blindly.
+    """
+    for attempt in range(1, _LLM_STEP_MAX_RETRIES + 1):
+        try:
+            return await asyncio.to_thread(llm_call, **kwargs)
+        except Exception as err:
+            if _is_retryable_llm_error(err) and attempt < _LLM_STEP_MAX_RETRIES:
+                delay_s = 1.5 * attempt
+                logger.warning(
+                    "%s LLM call failed with transient error (%s). Retry %d/%d in %.1fs.",
+                    step_name,
+                    err,
+                    attempt,
+                    _LLM_STEP_MAX_RETRIES,
+                    delay_s,
+                )
+                await asyncio.sleep(delay_s)
+                continue
+            raise
+
 
 # ---------------------------------------------------------------------------
 # Tool declarations for the Coder's agentic loop (Gemini function-calling)
@@ -32,146 +148,178 @@ _CODER_TOOL_DECLARATIONS = [
     # ------------------------------------------------------------------
     genai.protos.FunctionDeclaration(
         name="get_project_files",
-        description="List all .gd/.tscn/.tres files in the Godot project. ALWAYS call this first to see what already exists before creating anything.",
+        description="List all .gd/.tscn/.tres files. Call first.",
         parameters=genai.protos.Schema(type_=_T.OBJECT, properties={}),
     ),
     genai.protos.FunctionDeclaration(
         name="get_input_map",
-        description="Read the project's InputMap (action names → key bindings). Call before writing player movement/input code.",
+        description="Read InputMap (action names).",
         parameters=genai.protos.Schema(type_=_T.OBJECT, properties={}),
     ),
     genai.protos.FunctionDeclaration(
         name="node_exists",
-        description="Check if a node already exists in the currently open scene. Useful for verifying state, but NOT required before add_node/instance_scene as they handle duplicates safely.",
+        description="Check if node exists in open scene.",
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
-            properties={"node_path": _s(_T.STRING, "Path to check, e.g. 'Player' or 'UI/HUD'. Use '.' for root.")},
+            properties={"node_path": _s(_T.STRING, "Path to check.")},
             required=["node_path"],
         ),
     ),
     genai.protos.FunctionDeclaration(
         name="read_scene",
-        description="Get the current scene tree from the Godot Editor. Use after opening a scene to see existing nodes.",
+        description="Get current scene tree.",
         parameters=genai.protos.Schema(type_=_T.OBJECT, properties={}),
     ),
     genai.protos.FunctionDeclaration(
         name="create_scene",
-        description="Create a new .tscn scene file with the given root node type. Also opens it in the editor.",
+        description="Create .tscn scene logic.",
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
             properties={
-                "scene_path": _s(_T.STRING, "res:// path to the new scene, e.g. 'res://scenes/player.tscn'"),
-                "root_type": _s(_T.STRING, "Root node type, e.g. 'CharacterBody2D', 'Area2D', 'Node2D'"),
+                "scene_path": _s(_T.STRING, "res:// path"),
+                "root_type": _s(_T.STRING, "Root type (CharacterBody2D, etc)"),
             },
             required=["scene_path", "root_type"],
         ),
     ),
     genai.protos.FunctionDeclaration(
         name="open_scene",
-        description="Open an existing .tscn scene in the editor for modification.",
+        description="Open .tscn in editor.",
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
-            properties={"scene_path": _s(_T.STRING, "res:// path to the scene to open")},
+            properties={"scene_path": _s(_T.STRING, "res:// path")},
             required=["scene_path"],
         ),
     ),
     genai.protos.FunctionDeclaration(
-        name="add_node",
-        description="Add a node to the currently open scene. Just call it - duplicates will be skipped automatically.",
+        name="delete_node",
+        description=(
+            "⚠️ DESTRUCTIVE — permanently removes a node AND ALL ITS CHILDREN from the currently open scene. "
+            "Cannot be undone. Only use this as a corrective measure when a node was added by mistake "
+            "(e.g. a duplicate node that should not exist, or a misplaced node that needs to be "
+            "re-added in the correct scene). "
+            "DO NOT delete nodes that are part of the intended design. "
+            "DO NOT delete scene instance roots (use instance_scene instead). "
+            "Always call read_scene first to confirm the exact node_path before deleting. "
+            "After deleting, call save_scene to persist the change."
+        ),
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
             properties={
-                "parent_path": _s(_T.STRING, "Parent node path. Use '.' for root."),
-                "node_type": _s(_T.STRING, "Godot node type, e.g. 'Sprite2D', 'CollisionShape2D'"),
-                "node_name": _s(_T.STRING, "SHORT semantic name, e.g. 'Sprite', 'Collision', 'Player'. NEVER use the type name as the node name."),
+                "node_path": _s(_T.STRING, "Path of the node to delete (e.g. 'Sprite2D' or 'Player/Sprite2D')"),
+            },
+            required=["node_path"],
+        ),
+    ),
+    genai.protos.FunctionDeclaration(
+        name="add_node",
+        description="Add node to open scene.",
+        parameters=genai.protos.Schema(
+            type_=_T.OBJECT,
+            properties={
+                "parent_path": _s(_T.STRING, "Parent path ('.' for root)"),
+                "node_type": _s(_T.STRING, "Type (Sprite2D)"),
+                "node_name": _s(_T.STRING, "Name (Sprite)"),
             },
             required=["parent_path", "node_type", "node_name"],
         ),
     ),
     genai.protos.FunctionDeclaration(
         name="set_property",
-        description="Set a property on a node. Use for shape resources (RectangleShape2D etc). NEVER use for textures — load textures in GDScript instead.",
+        description="Set node property. For textures/shapes, use 'res://...' path string.",
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
             properties={
-                "node_path": _s(_T.STRING, "Node path in the scene, e.g. 'Collision'"),
-                "property_name": _s(_T.STRING, "Property name, e.g. 'shape'"),
-                "value": _s(_T.STRING, "Property value as a string or JSON-serialisable value"),
+                "node_path": _s(_T.STRING, "Node path"),
+                "property_name": _s(_T.STRING, "Property"),
+                "value": _s(_T.STRING, "Value (string/path)"),
             },
             required=["node_path", "property_name", "value"],
         ),
     ),
     genai.protos.FunctionDeclaration(
         name="create_script",
-        description="Write a GDScript (.gd) file to disk. Always validate complex scripts first. Load textures inside _ready() using load(\"res://...\"), never via set_property.",
+        description="Write .gd file. Use set_property for static textures.",
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
             properties={
-                "file_path": _s(_T.STRING, "res:// or absolute path to the script, e.g. 'res://scripts/enemy.gd'"),
-                "content": _s(_T.STRING, "Full GDScript source code"),
+                "file_path": _s(_T.STRING, "res:// path"),
+                "content": _s(_T.STRING, "GDScript code"),
             },
             required=["file_path", "content"],
         ),
     ),
     genai.protos.FunctionDeclaration(
         name="validate_script",
-        description="Validate GDScript syntax without writing to disk. Returns 'Script is valid' or an error. Call before create_script for complex scripts.",
+        description="Validate GDScript syntax.",
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
-            properties={"content": _s(_T.STRING, "GDScript source to validate")},
+            properties={"content": _s(_T.STRING, "Code")},
             required=["content"],
         ),
     ),
     genai.protos.FunctionDeclaration(
         name="attach_script",
-        description="Attach a script file to a node in the currently open scene.",
+        description="Attach script to node.",
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
             properties={
-                "node_path": _s(_T.STRING, "Node path, e.g. '.' for root, or 'Sprite'"),
-                "script_path": _s(_T.STRING, "res:// path to the .gd script"),
+                "node_path": _s(_T.STRING, "Node path"),
+                "script_path": _s(_T.STRING, "res:// path"),
             },
             required=["node_path", "script_path"],
         ),
     ),
     genai.protos.FunctionDeclaration(
         name="save_scene",
-        description="Save the currently open scene to disk. CRITICAL — MUST be called after add_node/set_property/attach_script or changes are lost.",
+        description="Save open scene.",
         parameters=genai.protos.Schema(type_=_T.OBJECT, properties={}),
     ),
     genai.protos.FunctionDeclaration(
         name="instance_scene",
-        description="Instance a .tscn sub-scene as a child of a node. Just call it - duplicates will be skipped automatically. Use to add player/enemy/UI into the main scene.",
+        description=(
+            "Instance a .tscn as a child of parent_path. "
+            "By default rejects a second instance of the same scene under the same parent — "
+            "pass allow_multiple:true ONLY when multiple instances are intentional (e.g. enemies, coins, projectiles). "
+            "Never use node_name to work around a duplicate rejection."
+        ),
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
             properties={
-                "scene_path": _s(_T.STRING, "res:// path to the .tscn to instance"),
-                "parent_path": _s(_T.STRING, "Parent node path in the current scene"),
-                "node_name": _s(_T.STRING, "Name for the instance node, e.g. 'Player'"),
+                "scene_path": _s(_T.STRING, "res:// path"),
+                "parent_path": _s(_T.STRING, "Parent path"),
+                "node_name": _s(_T.STRING, "Optional override name for the instance root"),
+                "allow_multiple": _s(_T.BOOLEAN, "Set true only when multiple instances of the same scene are intentional (enemies, coins, etc.)"),
             },
             required=["scene_path", "parent_path"],
         ),
     ),
     genai.protos.FunctionDeclaration(
         name="set_main_scene",
-        description="Set the main scene that Godot runs when pressing Play (F5). Must be called once.",
+        description="Set project main scene.",
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
-            properties={"scene_path": _s(_T.STRING, "res:// path to the main scene")},
+            properties={"scene_path": _s(_T.STRING, "res:// path")},
             required=["scene_path"],
         ),
     ),
     genai.protos.FunctionDeclaration(
         name="scan_filesystem",
-        description="Tell Godot to re-scan files. Call after writing asset files and before using them.",
+        description="Rescan files.",
         parameters=genai.protos.Schema(type_=_T.OBJECT, properties={}),
     ),
     genai.protos.FunctionDeclaration(
         name="execute_godot_script",
-        description="Execute arbitrary GDScript in the Godot Editor context. Use for complex automation, ProjectSettings changes, or operations not covered by other tools.",
+        description=(
+            "Run arbitrary GDScript in the editor as a last resort ONLY. "
+            "NEVER use this to add nodes, instance scenes, set properties, or attach scripts — "
+            "use the dedicated tools (add_node, instance_scene, set_property, attach_script) instead. "
+            "Those tools have duplicate-prevention guards; this one does not. "
+            "Valid uses: reading editor state, triggering editor actions not covered by other tools."
+        ),
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
-            properties={"code": _s(_T.STRING, "GDScript code to execute (no 'func' or 'extends' — just the body)")},
+            properties={"code": _s(_T.STRING, "Code")},
             required=["code"],
         ),
     ),
@@ -180,100 +328,94 @@ _CODER_TOOL_DECLARATIONS = [
     # ------------------------------------------------------------------
     genai.protos.FunctionDeclaration(
         name="get_sprite",
-        description=(
-            "Acquire a single-frame 2D pixel art sprite. "
-            "ALWAYS call this BEFORE create_scene or create_script when the task needs a character, enemy, pickup, or icon sprite. "
-            "Returns the confirmed res:// path — use it directly in your GDScript load() call."
-        ),
+        description="Acquire 2D sprite. Returns res:// path.",
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
             properties={
-                "name": _s(_T.STRING, "Snake_case asset identifier, e.g. 'enemy_swarm_ship'"),
-                "description": _s(_T.STRING, "Concise visual description, e.g. 'pixel art red enemy spaceship top-down view transparent background'"),
-                "style": _s(_T.STRING, "Art style: pixel_art | flat | cartoon | hand_drawn (default: pixel_art)"),
-                "width": _s(_T.INTEGER, "Width in pixels, e.g. 24"),
-                "height": _s(_T.INTEGER, "Height in pixels, e.g. 24"),
-                "tags": _s(_T.STRING, "Comma-separated search tags, e.g. 'enemy,spaceship,pixel_art'"),
+                "name": _s(_T.STRING, "Asset name"),
+                "description": _s(_T.STRING, "Visual description"),
+                "style": _s(_T.STRING, "Style"),
+                "width": _s(_T.INTEGER, "Width"),
+                "height": _s(_T.INTEGER, "Height"),
+                "tags": _s(_T.STRING, "Tags"),
             },
             required=["name", "description"],
         ),
     ),
     genai.protos.FunctionDeclaration(
         name="get_spritesheet",
-        description=(
-            "Acquire a multi-frame sprite sheet (animation strip). "
-            "Call BEFORE create_scene when the task needs an animated character. "
-            "Returns the confirmed res:// path and frame metadata."
-        ),
+        description="Acquire sprite sheet. Returns res:// path.",
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
             properties={
-                "name": _s(_T.STRING, "Snake_case asset identifier, e.g. 'player_walk'"),
-                "description": _s(_T.STRING, "Concise visual description"),
-                "poses": _s(_T.STRING, "Comma-separated animation frames, e.g. 'idle,walk_1,walk_2,jump'"),
-                "style": _s(_T.STRING, "Art style: pixel_art | flat | cartoon | hand_drawn"),
-                "frame_width": _s(_T.INTEGER, "Width of each frame in pixels"),
-                "frame_height": _s(_T.INTEGER, "Height of each frame in pixels"),
-                "tags": _s(_T.STRING, "Comma-separated search tags"),
+                "name": _s(_T.STRING, "Asset name"),
+                "description": _s(_T.STRING, "Description"),
+                "poses": _s(_T.STRING, "Poses"),
+                "style": _s(_T.STRING, "Style"),
+                "frame_width": _s(_T.INTEGER, "Frame Width"),
+                "frame_height": _s(_T.INTEGER, "Frame Height"),
+                "tags": _s(_T.STRING, "Tags"),
             },
             required=["name", "description"],
         ),
     ),
     genai.protos.FunctionDeclaration(
         name="get_tileset",
-        description="Acquire a tileset image for Godot TileMaps. Call before creating TileMap scenes.",
+        description="Acquire tileset.",
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
             properties={
-                "name": _s(_T.STRING, "Asset identifier, e.g. 'space_tileset'"),
-                "description": _s(_T.STRING, "Concise visual description"),
-                "style": _s(_T.STRING, "Art style"),
-                "tile_size": _s(_T.INTEGER, "Pixels per tile (square)"),
-                "columns": _s(_T.INTEGER, "Number of tile columns"),
-                "rows": _s(_T.INTEGER, "Number of tile rows"),
-                "tile_types": _s(_T.STRING, "Comma-separated tile type labels, e.g. 'ground,wall,platform'"),
-                "tags": _s(_T.STRING, "Comma-separated search tags"),
+                "name": _s(_T.STRING, "Name"),
+                "description": _s(_T.STRING, "Description"),
+                "style": _s(_T.STRING, "Style"),
+                "tile_size": _s(_T.INTEGER, "Tile Size"),
+                "columns": _s(_T.INTEGER, "Cols"),
+                "rows": _s(_T.INTEGER, "Rows"),
+                "tile_types": _s(_T.STRING, "Types"),
+                "tags": _s(_T.STRING, "Tags"),
             },
             required=["name", "description"],
         ),
     ),
     genai.protos.FunctionDeclaration(
         name="get_background",
-        description="Acquire a 2D background image. Call before creating scenes that need a background.",
+        description="Acquire background.",
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
             properties={
-                "name": _s(_T.STRING, "Asset identifier, e.g. 'space_bg'"),
-                "description": _s(_T.STRING, "Concise visual description"),
-                "style": _s(_T.STRING, "Art style"),
-                "width": _s(_T.INTEGER, "Width in pixels (default 1280)"),
-                "height": _s(_T.INTEGER, "Height in pixels (default 720)"),
-                "tags": _s(_T.STRING, "Comma-separated search tags"),
+                "name": _s(_T.STRING, "Name"),
+                "description": _s(_T.STRING, "Description"),
+                "style": _s(_T.STRING, "Style"),
+                "width": _s(_T.INTEGER, "W"),
+                "height": _s(_T.INTEGER, "H"),
+                "tags": _s(_T.STRING, "Tags"),
             },
             required=["name", "description"],
         ),
     ),
     genai.protos.FunctionDeclaration(
         name="get_audio",
-        description="Acquire an audio asset (SFX or music). Call before creating scenes that need sound.",
+        description="Acquire audio.",
         parameters=genai.protos.Schema(
             type_=_T.OBJECT,
             properties={
-                "name": _s(_T.STRING, "Asset identifier, e.g. 'shoot_sfx'"),
-                "description": _s(_T.STRING, "Description of the sound"),
-                "audio_type": _s(_T.STRING, "'sfx' or 'music'"),
-                "duration_seconds": _s(_T.NUMBER, "Target duration in seconds"),
-                "tags": _s(_T.STRING, "Comma-separated search tags"),
+                "name": _s(_T.STRING, "Name"),
+                "description": _s(_T.STRING, "Description"),
+                "audio_type": _s(_T.STRING, "sfx/music"),
+                "duration_seconds": _s(_T.NUMBER, "Seconds"),
+                "tags": _s(_T.STRING, "Tags"),
             },
             required=["name", "description"],
         ),
     ),
 ]
 
-# Initialize LLM provider
-llm_provider = LLMFactory.get_provider()
+# Orchestration model: supervisor, reviewer (gemini-3-flash-preview)
+llm_provider = LLMFactory.get_provider(config.GEMINI_MODEL_FLASH)
+# Execution model: coder (gemini-3.1-flash-lite-preview)
+llm_provider_lite = LLMFactory.get_provider(config.GEMINI_MODEL_LITE)
 
-async def supervisor_node(state: StudioState) -> Dict:
+async def supervisor_node(state: StudioState, godot_interface: GodotInterface = None) -> Dict:
     """
     The Supervisor reads the current_task and gdd, then decides what actions to take.
     It updates the messages with instructions for the Coder.
@@ -286,6 +428,15 @@ async def supervisor_node(state: StudioState) -> Dict:
     logger.info(f"Supervisor processing task: {current_task}")
     log_node_start("Supervisor", current_task)
 
+    # Read the live editor state so the Supervisor knows which scene is currently
+    # open — this prevents it from planning work that assumes a different open scene.
+    current_scene_info = ""
+    if godot_interface and godot_interface.manager.is_connected(project_path):
+        try:
+            current_scene_info = await godot_interface.read_scene(project_path)
+        except Exception:
+            pass
+
     # Pre-load file structure context (run in thread — synchronous file I/O)
     file_tree = await asyncio.to_thread(ProjectScanner.scan_directory, project_path)
     file_tree_str = json.dumps(file_tree, indent=2)
@@ -293,117 +444,68 @@ async def supervisor_node(state: StudioState) -> Dict:
     # Pre-load project settings (InputMap, Autoloads, Layers) context
     project_context = await asyncio.to_thread(ProjectScanner.get_project_context, project_path)
 
-    # Build a prompt for the supervisor
-    
-    # RAG: Index current project code to help Supervisor understand existing naming conventions
-    await asyncio.to_thread(project_rag.index_project, project_path)
-    
-    # Query for project structure and relevant docs
-    rag_query = f"{current_task} common pitfalls"
-    godot_docs_list, project_rag_list = await asyncio.gather(
-        asyncio.to_thread(godot_rag.query, rag_query, 3),
-        asyncio.to_thread(project_rag.query, current_task, 5),
-    )
-    rag_context = "\n\n".join(godot_docs_list + project_rag_list)
+    prompt = f"""You are the Supervisor for a Godot 4.x project.
 
-    prompt = f"""You are the Supervisor for a game development AI system that controls Godot 4.x.
-
-Game Design Document:
+GDD:
 {gdd}
 
-Current Task:
+Task:
 {current_task}
 
-Previously Completed Tasks (these are DONE — do NOT redo them; build on top of their results):
-{completed_tasks_context or "None yet — this is the first task."}
+Completed:
+{completed_tasks_context or "None"}
 
-Project Path: {project_path}
-
-Project File Tree:
+Files:
 {file_tree_str}
 
 {project_context}
 
-## REFERENCE DOCS & EXISTING CODE:
-{rag_context}
+Currently Open Scene in Editor:
+{current_scene_info}
 
-Your job is to analyze this task and decompose it into a specific list of step-by-step instructions for the Coder.
-Encourage the Coder to batch operations where possible (e.g. "Create scene AND add nodes X, Y, Z").
+## INSTRUCTIONS
+1. **Scene Structure**: Maintain proper, discrete scene architecture.
+   - Create separate `.tscn` files for entities (Player, Enemy, UI components).
+   - Use `instance_scene` to place these entities into the Main scene or Level scenes.
+   - NEVER instruct the Coder to use `add_node` for any entity node (CharacterBody2D, RigidBody2D, Area2D, etc.) OR any component node (Sprite2D, CollisionShape2D, AudioStreamPlayer, etc.) directly in the Main or Level scene. All such nodes belong inside their entity's own .tscn.
+   - Correct entity workflow: `create_scene(entity.tscn)` → `add_node` children inside that scene → `save_scene` → `open_scene(main.tscn)` → `instance_scene(entity.tscn)` → `save_scene`. No deviations.
+2. **Architecture Guard**: The engine will BLOCK attempts to add nodes directly to instances (e.g. adding a Sprite to a Player instance in Main).
+   - If you need to add a node to an entity, use `open_scene` to edit the entity's source file (e.g. `player.tscn`) directly.
+   - Do NOT try to bypass this. It prevents scene corruption and "Load Errors".
+3. **Asset Timing**: Acquire assets (sprites, audio) *only if this specific task uses them immediately*. Do not pre-optimize by fetching assets for future tasks.
+4. **Simplicity**: Keep the steps lightweight but precise. Do not add bloat or useless constraints.
+5. **Instancing**: Ensure scenes are correctly instanced and parented.
 
-**CRITICAL RULE - STRICT TASK SCOPE**: You MUST stick absolutely to the scope of the task defined above. Do NOT invent completely new features, add extra nodes, or modify unconnected systems outside the current task's objective.
-**CRITICAL RULE - REALITY GROUNDING**: Never invent string identifiers for input actions, autoloads, or collision layers. You MUST only use the items listed in the "PROJECT GROUND TRUTH CONTEXT" above. If you need a basic input, strictly rely on default UI actions like `ui_up`, `ui_down`, etc., instead of inventing actions like `move_up`.
+Translate this goal into specific, sequential Godot implementation steps for the Coder.
+Use `create_scene` -> `add_node` -> `set_property` -> `save_scene`.
 
-AVAILABLE TOOLS the Coder has:
-- create_scene(path, root_type): Create a new .tscn scene (also opens it in editor)
-- add_node(parent_path, node_type, node_name): Add nodes to the open scene
-- set_property(node_path, property_name, value): Set node properties (textures, shapes, etc.)
-- attach_script(node_path, script_path): Attach a GDScript to a node
-- create_script(path, content): Write a .gd script file
-- save_scene(): SAVE the open scene to disk — MUST be called after modifying a scene
-- open_scene(path): Open an existing scene for editing
-- instance_scene(scene_path, parent_path, node_name): Instance a sub-scene (.tscn) as a child
-- scan_filesystem(): Refresh Godot's file index after writing new files
-- execute_godot_script(code): Execute arbitrary GDScript in the editor context. Use this for ANY complex operation not covered by other tools (e.g. changing editor settings, multi-step automation, or using internal Godot APIs).
-- get_sprite, get_spritesheet, get_tileset, get_background, get_audio: Acquire game assets
-- validate_script(content): Validate GDScript syntax before writing to disk — call before create_script when scripts are complex
-- get_project_files(): List all .gd/.tscn/.tres files in the project — call first to check what already exists
-- get_input_map(): Read defined input actions (e.g. ui_left, jump) — call before writing player input code
-- node_exists(node_path): Check if a specific node already exists in the open scene before adding it
+## STRICT RULES
+1. **Scope**: Keep to the Task.
+2. **Tools**:
+   - `get_project_files()`: CALL FIRST to see existing files.
+   - `set_property(node, "texture", "res://...")`: ALWAYS use this to assign textures.
+   - `create_scene`: Use meaningful root types (CharacterBody2D).
+   - `add_node`: Use short, semantic names ("Sprite" not "Sprite2D", "Collision" not "CollisionShape2D"). Only instruct `add_node` within an entity's own .tscn, never in main.tscn or a level scene.
+3. **Assets**:
+   - IF the task needs visual/audio, STEP 1 is: "Call `get_sprite`/`get_audio`...".
+   - Do NOT reference assets that don't exist.
+4. **Naming**:
+   - Scene nodes must match script references (e.g. `$Sprite` node requires `$Sprite` in code).
 
-CRITICAL INSTRUCTIONS FOR YOUR PLAN:
-1. **ALWAYS START with get_project_files** to see what scenes and scripts already exist. If a .tscn file already exists for this task, instruct the Coder to open it and read the scene tree first — do NOT recreate it.
-2. **DO NOT CHECK FOR NODE EXISTENCE manually**. The `add_node` and `instance_scene` tools handle duplicate checks safely. Skip `node_exists` or `read_scene` calls unless you really need to inspect properties.
-3. **USE DESCRIPTIVE NODE NAMES**: Never use generic names like "Sprite2D", "CollisionShape2D", or "Node". Use short, meaningful names like "Sprite", "Collision", "Player", "HUD". This prevents name collisions between siblings and sub-scenes.
-   **CRITICAL CONSISTENCY CHECK**: If you name a node "Sprite" in the scene, your script MUST refence it as `$Sprite`, not `$Sprite2D`. Mismatches cause "null instance" crashes.
-4. Always include "save_scene" step after adding nodes/properties to a scene.
-5. Always include "set_main_scene" for the first task that creates the main/root scene.
-6. When composing scenes, instruct the Coder to use "instance_scene" to add sub-scenes (player, enemies) into the main scene rather than recreating all nodes.
-7. ASSET ACQUISITION — MANDATORY FIRST STEP for any scene with visual/audio elements:
-   Whenever the task creates a character, enemy, pickup, background, or tileset that needs a
-   visual, your plan MUST include an explicit asset acquisition step BEFORE scene/script steps.
-   Use this exact format when giving the Coder instructions:
-     - Characters/enemies/sprites: "Call get_sprite('<name>', '<description>', 'pixel_art', <w>, <h>)"
-       e.g. "Call get_sprite('player', 'pixel art platformer hero facing right', 'pixel_art', 32, 64)"
-       e.g. "Call get_sprite('enemy_slime', 'green pixel art slime enemy', 'pixel_art', 32, 32)"
-     - Animated characters: "Call get_spritesheet('<name>', '<desc>', 'idle,walk,jump', 'pixel_art', <fw>, <fh>)"
-     - Tile levels: "Call get_tileset('tileset', '<desc>', 'pixel_art', 16, 8, 4, 'ground,wall,platform')"
-     - Backgrounds: "Call get_background('background', '<desc>', 'pixel_art', 1280, 720)"
-     - Sounds/music: "Call get_audio('<name>', '<desc>', 'sfx', 1)"
-   Do NOT skip this step — the Coder cannot load a texture that doesn't exist on disk.
-   Only skip asset acquisition if the asset file already appears in the Project File Tree above.
-7. TEXTURE ASSIGNMENT:
-   - Textures and sprites MUST be loaded inside GDScript (_ready) using load("res://..."), NEVER via set_property.
-   - **SAFETY PATTERN**: To avoid "null instance" errors, prefer attaching the script DIRECTLY to the Sprite node if possible.
-     - If script is on Sprite: USE `texture = load(...)`
-     - If script is on Parent: USE `$Sprite.texture = load(...)` (Ensure $Sprite name matches `add_node` name exactly!)
-8. SCALE AND VIEWPORT — MANDATORY: The FIRST action of any game must call execute_godot_script to configure:
-   - Window: 1280×720 (viewport_width=1280, viewport_height=720)
-   - Pixel art rendering: rendering/textures/canvas_textures/default_texture_filter = 0 (Nearest)
-   - Renderer: rendering/renderer/rendering_method = "gl_compatibility"
-   Then call ProjectSettings.save().
-   Camera2D zoom: for 32px sprites use Vector2(2,2); for 64px use Vector2(1,1). ALWAYS set zoom explicitly.
-   Effective viewport at zoom 2×: 640×360 world units. Position ground at y=300, player at y=250, platforms at y=100-200.
-   NEVER rely on default camera/window settings — they will make sprites microscopic.
-9. COMPLETE GAME CHECKLIST: If the task is to create a complete or playable game, your plan MUST cover ALL of the following:
-   - Player scene: CharacterBody2D + Sprite2D + CollisionShape2D + player.gd (movement, health, input via get_axis/is_action_just_pressed)
-   - Enemy/obstacle scene with simple AI or patrol behavior script
-   - Main scene (Node2D): instances player + enemies via instance_scene, has Camera2D with zoom set
-   - HUD scene (CanvasLayer): score Label, health ProgressBar or Label, connected to GameManager signals
-   - GameManager autoload script (res://scripts/game_manager.gd): score, lives, game_over(), restart() — registered via execute_godot_script
-   - set_main_scene() called on the main scene
-   - Collision layers: player on layer 1, enemies on layer 2, collectibles on layer 4, environment on layer 8
-   - Game-over logic: get_tree().paused = true, show game-over screen, restart button connected to GameManager.restart()
-
-Break the task into smaller, logical chunks. Provide clear, actionable instructions.
+Output a clear, numbered plan.
 """
     
     try:
-        response = await asyncio.to_thread(
+        response = await _run_llm_step_with_retries(
+            "Supervisor",
             llm_provider.generate,
             prompt=prompt,
-            system_instruction="You are a game development project supervisor. You break down tasks into clear, actionable steps.",
+            system_instruction="You are a game development project supervisor. You break down tasks into clear, actionable steps for a specific Godot 4.x environment.",
         )
         
+        # Log the Supervisor's output to the terminal
+        print(f"\n\033[94m[Supervisor Plan for Task '{current_task}']:\033[0m\n{response}\n")
+
         # Add supervisor's instructions to messages
         new_message = AIMessage(content=f"[Supervisor]: {response}")
         log_node_done("Supervisor")
@@ -436,6 +538,16 @@ async def _dispatch_tool(
     """
     pending_review = None
     approved_assets = approved_assets or {}
+    start = time.monotonic()
+    final_status = "completed"
+
+    def _finish(res_value: Any, pending: Optional[Dict[str, Any]] = None, status: str = "completed"):
+        elapsed = time.monotonic() - start
+        if status == "completed":
+            logger.info("Tool %s completed in %.2fs", tool_name, elapsed)
+        else:
+            logger.info("Tool %s %s in %.2fs", tool_name, status, elapsed)
+        return str(res_value), pending
 
     try:
         if tool_name == "get_project_files":
@@ -458,6 +570,11 @@ async def _dispatch_tool(
 
         elif tool_name == "open_scene":
             result = await godot_interface.open_scene(project_path, tool_args["scene_path"])
+
+        elif tool_name == "delete_node":
+            result = await godot_interface.delete_node(
+                project_path, tool_args["node_path"]
+            )
 
         elif tool_name == "add_node":
             result = await godot_interface.add_node(
@@ -527,7 +644,7 @@ async def _dispatch_tool(
             # Idempotency check: if already approved, reuse without calling pipeline
             if asset_name in approved_assets:
                 path = approved_assets[asset_name]
-                return f"Asset '{asset_name}' is already approved at {path}. Use this path in your code.", None
+                return _finish(f"Asset '{asset_name}' is already approved at {path}. Use this path in your code.", None)
 
             log_asset_acquire("sprite", asset_name, tool_args.get("description", ""))
             options = await asset_interface.get_sprite_options(
@@ -558,7 +675,7 @@ async def _dispatch_tool(
             
             if asset_name in approved_assets:
                 path = approved_assets[asset_name]
-                return f"Asset '{asset_name}' is already approved at {path}. Use this path in your code.", None
+                return _finish(f"Asset '{asset_name}' is already approved at {path}. Use this path in your code.", None)
 
             options = await asset_interface.get_spritesheet_options(
                 project_path=project_path,
@@ -597,7 +714,7 @@ async def _dispatch_tool(
 
             if asset_name in approved_assets:
                 path = approved_assets[asset_name]
-                return f"Asset '{asset_name}' is already approved at {path}. Use this path in your code.", None
+                return _finish(f"Asset '{asset_name}' is already approved at {path}. Use this path in your code.", None)
 
             result_json = await asset_interface.get_tileset(
                 project_path=project_path,
@@ -630,7 +747,7 @@ async def _dispatch_tool(
 
             if asset_name in approved_assets:
                 path = approved_assets[asset_name]
-                return f"Asset '{asset_name}' is already approved at {path}. Use this path in your code.", None
+                return _finish(f"Asset '{asset_name}' is already approved at {path}. Use this path in your code.", None)
 
             result_json = await asset_interface.get_background(
                 project_path=project_path,
@@ -661,7 +778,7 @@ async def _dispatch_tool(
 
             if asset_name in approved_assets:
                 path = approved_assets[asset_name]
-                return f"Asset '{asset_name}' is already approved at {path}. Use this path in your code.", None
+                return _finish(f"Asset '{asset_name}' is already approved at {path}. Use this path in your code.", None)
 
             result_json = await asset_interface.get_audio(
                 project_path=project_path,
@@ -692,8 +809,9 @@ async def _dispatch_tool(
     except Exception as e:
         result = f"Tool {tool_name} FAILED: {str(e)}"
         logger.error("Tool %s raised: %s", tool_name, e, exc_info=True)
+        final_status = "failed"
 
-    return str(result), pending_review
+    return _finish(result, pending_review, status=final_status)
 
 
 async def coder_node(state: StudioState, godot_interface: GodotInterface, asset_interface: AssetInterface = None) -> Dict:
@@ -727,6 +845,15 @@ async def coder_node(state: StudioState, godot_interface: GodotInterface, asset_
     saved_history = state.get("tool_loop_history")
     pending_tool_call = state.get("pending_tool_call")
     
+    # Detect reviewer-fix mode early so it can influence persistent instructions.
+    latest_reviewer_feedback = ""
+    for msg in messages:
+        if isinstance(msg, AIMessage) and "[Reviewer]" in msg.content:
+            latest_reviewer_feedback = msg.content
+    reviewer_fix_mode = bool(
+        latest_reviewer_feedback and "APPROVED" not in latest_reviewer_feedback.upper()
+    )
+
     # Construct persistent system instruction (rules + checked assets)
     approved_assets_str = ""
     if approved_assets:
@@ -735,37 +862,27 @@ async def coder_node(state: StudioState, godot_interface: GodotInterface, asset_
             + "\n".join(f"  - {n}: {p}" for n, p in approved_assets.items())
         )
 
-    system_instruction = f"""You are a Godot 4.x Expert and Automation Engineer implementing a game development task.
-You have a set of tools to interact with the Godot Editor and acquire game assets.
-Work efficiently: BATCH your tool calls. You can (and should) call multiple tools in a single turn.
-For example: Create a scene, add 5 nodes, set their properties, and save the scene — all in ONE response.
+    reviewer_fix_system_rules = ""
+    if reviewer_fix_mode:
+        reviewer_fix_system_rules = """
+10. **Reviewer-fix mode**: This pass is for targeted corrections only. Do NOT restart implementation.
+11. **No unnecessary reacquisition**: Do NOT call asset tools unless the reviewer explicitly requests a new/different asset.
+12. **Minimal edits**: Prefer patching existing files/nodes over recreating scenes/scripts.
+"""
 
-## MANDATORY WORKFLOW ORDER
-1. If the task needs a SPRITE, BACKGROUND, TILESET, or AUDIO — check "Already-approved asset paths" first.
-   - If present, reuse the existing res:// path and do NOT call the asset tool again.
-   - If not present, call the appropriate asset tool (get_sprite / get_spritesheet / ...).
-   You will receive the confirmed res:// path in the tool result — use that exact path in your GDScript load() call.
-2. Create scenes and scripts AFTER you have the asset paths confirmed.
-3. DO NOT manually check if nodes exist using node_exists(). The add_node() and instance_scene() tools already handle duplicate checks safely.
-4. ALWAYS call save_scene() after modifying a scene.
-5. OPTIMIZE CONFIGURATION: When setting multiple project settings (window size, renderer, physics layers), write a SINGLE `execute_godot_script` block that sets them all at once.
+    system_instruction = f"""You are a Godot 4.x Expert. Implement the task using the provided tools. Issue write operations ONE at a time.
 
-## GODOT 4 CRITICAL FACTS
-- CharacterBody2D (NOT KinematicBody2D). move_and_slide() takes NO arguments.
-- Sprite2D (NOT Sprite). AnimatedSprite2D for animations.
-- SCALE & VISIBILITY: When instancing nodes via script, ALWAYS setting `position`, `scale`, and `owner` is mandatory.
-  - Pixel art scale: If using low-res assets (e.g., 32x32), use a zoomed Camera2D (Zoom 2.0 or 4.0) rather than scaling sprites up, unless specific effect is desired.
-  - Visibility: Ensure nodes are added to the tree (`add_child`) and are not hitting `modulate.a = 0`.
-- NODE COMPATIBILITY: Do NOT add `Control` nodes (UI) as children of `Node2D` without a `CanvasLayer` or proper anchoring. UI should usually be in a separate `CanvasLayer`.
-- INSTANCE SAFETY: Just call `instance_scene`. The tool handles parent/name checks for you.
-- Textures MUST be loaded in _ready() via load("res://...") — NEVER via set_property.
-- Use @onready var node: Type = $NodeName for child references.
-- Signals: signal_name.connect(callable) (NOT old connect("signal_name", ...)).
-- CollisionShape2D needs a shape resource set via set_property.
-- HUD elements must be children of CanvasLayer.
-- Name nodes with short semantic names (Sprite, Collision) NOT type names (Sprite2D).
-- REALITY GROUNDING: only use input actions listed in get_input_map() results or
-  the default ui_* actions. Never invent action names like 'move_up'.
+## RULES
+1. **No duplicates**: The context shows existing scene contents. Before adding a node or instancing a scene, check whether it is already there. Do not add it again. When a scene is instanced, its nodes become available in the parent scene — do not add them again. If you need to modify an instanced node, open the source scene and edit it there.
+2. **Assets**: Check 'Approved Assets' first. If an asset is missing, call the asset tool and WAIT for approval before proceeding.
+3. **Textures**: ALWAYS assign textures via `set_property(node, "texture", "res://...")`. This is VERY IMPORTANT
+4. **Names**: Use short semantic names — "Sprite" not "Sprite2D", "Collision" not "CollisionShape2D".
+5. **Scene structure**: Entity components (Sprite2D, CollisionShape2D, etc.) live inside entity .tscn files. Main/level scenes only use `instance_scene` to place entities — never `add_node` for entity-type nodes directly into main. Never use add node on an instance (e.g. adding a Sprite to a Player instance in Main) — open the source scene to edit instead.
+6. **Godot 4**: `move_and_slide()` no args. Signals: `signal.connect(Callable)`. Use `validate_script` if unsure of syntax.
+7. **execute_godot_script**: NEVER use this to add/remove nodes, instance scenes, or set properties. Use the dedicated tools — they have duplicate guards this one does not.
+8. **Instance nodes (is_instance: true)**: When `read_scene` shows a node with `"is_instance": true` and a `"scene_file_path"`, that node is a PackedScene instance. You MUST NOT call `add_node` or `set_property` targeting that node or ANY of its descendants while the parent scene is open. Doing so creates local overrides that cause Godot "Load Error: name clashes" on every project reload. The ONLY correct action is: call `open_scene(scene_file_path)` → make changes there → `save_scene` → `open_scene(original_scene)`.
+9. **ARCHITECTURAL VIOLATION response**: If `add_node` returns "ARCHITECTURAL VIOLATION", it means you tried to modify a scene instance or one of its children. STOP immediately. Do NOT retry `add_node` with the same or a different name. REQUIRED: call `open_scene` with the `scene_file_path` shown in the error message, then add the node there.
+{reviewer_fix_system_rules}
 {approved_assets_str}
 """
 
@@ -784,7 +901,7 @@ For example: Create a scene, add 5 nodes, set their properties, and save the sce
         else:
             function_response_result = (
                 f"Asset acquisition approved. Check res://assets/ for the file. "
-                "Use load() in _ready() to assign it to the Sprite2D texture."
+                "Use set_property(node, 'texture', 'path') to assign it."
             )
 
         # FIX: Instead of popping the entire user turn, we find the placeholder
@@ -824,10 +941,21 @@ For example: Create a scene, add 5 nodes, set their properties, and save the sce
                 break
 
         # Incorporate reviewer feedback if present
-        reviewer_feedback = ""
-        for msg in messages:
-            if isinstance(msg, AIMessage) and "[Reviewer]" in msg.content:
-                reviewer_feedback = msg.content
+        reviewer_feedback = latest_reviewer_feedback
+        if reviewer_feedback:
+            logger.warning(f"[Coder] Acting on reviewer feedback:\n{reviewer_feedback[:600]}")
+
+        # In reviewer-fix mode, prevent full task restarts and unnecessary asset reacquisition.
+        reviewer_fix_rules = ""
+        if reviewer_fix_mode:
+            reviewer_fix_rules = """
+## REVIEWER FIX MODE (highest priority for this pass)
+- This is a correction pass, NOT a fresh implementation pass.
+- Apply the minimal set of edits needed to resolve reviewer issues.
+- Do NOT reacquire assets or recreate scenes/scripts that already exist unless the reviewer explicitly asks for a different/new asset.
+- If reviewer feedback flags path/API/property mistakes, patch those directly in existing files/nodes.
+- If supervisor instructions conflict with reviewer fixes, prioritize reviewer fixes for this pass.
+"""
 
         # Auto-populate file context with all .gd scripts
         import os
@@ -856,35 +984,67 @@ For example: Create a scene, add 5 nodes, set their properties, and save the sce
             f"File: {path}\n{content}\n" for path, content in file_context.items()
         )
 
+        # Read existing .tscn scene files and parse them into a structured summary
+        # instead of dumping raw .tscn text. Raw .tscn (e.g. instance=ExtResource("1_abc"))
+        # is hard for LLMs to parse; the structured summary makes it unambiguous.
+        tscn_files_raw: Dict[str, str] = {}
+        scene_context_str = ""
+        try:
+            from pathlib import Path as _SPath
+            for root, dirs, files in os.walk(_SPath(project_path)):
+                if any(ign in _SPath(root).parts for ign in ['.git', '.godot', 'venv', 'node_modules', 'backend', '.claude']):
+                    continue
+                for file in files:
+                    if file.endswith('.tscn'):
+                        fp = _SPath(root) / file
+                        try:
+                            content = fp.read_text(encoding='utf-8')
+                            if len(content) < 10000:
+                                rel = f"res://{fp.relative_to(_SPath(project_path))}"
+                                tscn_files_raw[rel] = content
+                        except Exception:
+                            pass
+            scene_context_str = _build_tscn_summary(tscn_files_raw)
+        except Exception as e:
+            logger.warning("Could not load scene context: %s", e)
+
         # --- Pre-fetch all read-only context concurrently to save LLM iterations ---
-        # Run filesystem scan, project settings, Godot bridge queries, and RAG in parallel.
+        # Run filesystem scan, project settings, Godot bridge queries in parallel.
         
-        # 0. Index current project code for RAG
-        await asyncio.to_thread(project_rag.index_project, project_path)
-        
-        rag_query = f"{current_task} {supervisor_instruction}"
         (
             file_tree,
             project_context,
-            godot_docs_list,
-            project_rag_list,
             godot_project_files,
             godot_input_map,
+            current_scene_live,
         ) = await asyncio.gather(
             asyncio.to_thread(ProjectScanner.scan_directory, project_path),
             asyncio.to_thread(ProjectScanner.get_project_context, project_path),
-            asyncio.to_thread(godot_rag.query, rag_query, 5),
-            asyncio.to_thread(project_rag.query, rag_query, 3),
             godot_interface.get_project_files(project_path),
             godot_interface.get_input_map(project_path),
+            godot_interface.read_scene(project_path),
         )
-        
-        godot_docs_context = "\n\n".join(godot_docs_list + project_rag_list)
         
         file_tree_str = json.dumps(file_tree, indent=2)
 
+        # When re-running after Reviewer feedback, extract what the previous Coder
+        # run already did so the Coder knows exactly which nodes/scenes exist and
+        # doesn't blindly re-add them.
+        prev_attempt_ctx = ""
+        if reviewer_feedback:
+            messages = state.get("messages", [])
+            for msg in reversed(messages):
+                if isinstance(msg, AIMessage) and "[Coder]" in msg.content:
+                    prev_attempt_ctx = (
+                        f"\n\n## PREVIOUS ATTEMPT — ALREADY COMPLETED (do NOT redo these)\n"
+                        f"{msg.content}\n"
+                        f"Fix ONLY what the Reviewer flagged below. Everything else is done."
+                    )
+                    break
+
         reviewer_ctx = (
-            f"\n\nREVIEWER FEEDBACK (must be fixed in this pass):\n{reviewer_feedback}"
+            f"\n\n## REVIEWER FEEDBACK (must be fixed in this pass):\n{reviewer_feedback}"
+            f"{prev_attempt_ctx}"
             if reviewer_feedback else ""
         )
 
@@ -910,7 +1070,18 @@ File Tree:
 Existing Scripts:
 {file_context_str}
 
-{godot_docs_context}{reviewer_ctx}
+## CURRENTLY OPEN SCENE IN EDITOR (live in-memory state — authoritative over disk)
+{current_scene_live}
+This is what the editor has open RIGHT NOW. Use this to know which scene is active before issuing any open_scene, add_node, or instance_scene calls.
+
+## ALREADY-INSTANCED SUB-SCENES (parsed from disk — do NOT instance these again in the listed parent)
+{scene_context_str or "No .tscn files found."}
+
+## IMPORTANT: Any scene listed above as already instanced in a parent scene MUST NOT be instanced again.
+## To modify the internals of an instanced scene, use open_scene(scene_path) — never add nodes to the instance directly.
+
+{reviewer_ctx}
+{reviewer_fix_rules}
 
 Current Task: {current_task}
 
@@ -918,12 +1089,18 @@ Supervisor Instructions:
 {supervisor_instruction}
 """
 
-        initial_user_message = (
-            f"{context_msg}\n\n"
-            f"Please implement the following task in Godot 4: {current_task}\n\n"
-            "Remember: start with get_project_files(), then acquire any needed assets "
-            "BEFORE creating scenes or scripts."
-        )
+        if reviewer_fix_mode:
+            initial_user_message = (
+                f"{context_msg}\n\n"
+                f"Please perform a targeted fix pass for this task in Godot 4: {current_task}\n\n"
+                "Do not restart the task. Fix only the reviewer-reported issues."
+            )
+        else:
+            initial_user_message = (
+                f"{context_msg}\n\n"
+                f"Please implement the following task in Godot 4: {current_task}\n\n"
+                "Acquire any needed assets BEFORE creating scenes or scripts."
+            )
 
         history = [{"role": "user", "parts": [initial_user_message]}]
 
@@ -936,6 +1113,12 @@ Supervisor Instructions:
     screenshot_data = None
     hit_max_iterations = False  # BUG 7: track whether we exited via the safety cap
 
+    # Python-level dedup: track scenes instanced in this Coder run to catch
+    # duplicate instance_scene calls within the same loop.
+    _instanced_this_run: Set[str] = set()
+    # Track which scene is currently open so add_node log lines include scene context.
+    _current_open_scene: str = ""
+
     for iteration in range(MAX_ITERATIONS):
         if not godot_interface.manager.is_connected(project_path):
             execution_log.append("ABORTED: Godot client disconnected")
@@ -944,8 +1127,9 @@ Supervisor Instructions:
 
         # Call the LLM with current history
         try:
-            result = await asyncio.to_thread(
-                llm_provider.generate_with_tools,
+            result = await _run_llm_step_with_retries(
+                f"Coder iteration {iteration}",
+                llm_provider_lite.generate_with_tools,
                 system_instruction=system_instruction,
                 history=history,
                 tool_declarations=_CODER_TOOL_DECLARATIONS,
@@ -1017,6 +1201,24 @@ Supervisor Instructions:
                 
             tc_args = tc.get("args", {})
 
+            # Python-level dedup for instance_scene: catch duplicates regardless of
+            # node_name or whether the Godot scene was reloaded since last open_scene.
+            if tc_name == "instance_scene" and not tc_args.get("allow_multiple", False):
+                raw_path = tc_args.get("scene_path", "")
+                canon = raw_path if raw_path.startswith("res://") else f"res://{raw_path}"
+                if canon in _instanced_this_run:
+                    skip_msg = f"[instance_scene SKIPPED — duplicate]: '{canon}' was already instanced in this run."
+                    execution_log.append(skip_msg)
+                    logger.info(skip_msg)
+                    function_response_parts.append({
+                        "function_response": {
+                            "name": tc_name,
+                            "response": {"result": skip_msg},
+                        }
+                    })
+                    continue
+                _instanced_this_run.add(canon)
+
             detail = tc_args.get("name") or tc_args.get("scene_path") or tc_args.get("file_path") or ""
             logger.info("Coder tool call [iter %d]: %s(%s)", iteration, tc_name, list(tc_args.keys()))
             log_action_exec(iteration + 1, MAX_ITERATIONS, tc_name, detail)
@@ -1025,7 +1227,16 @@ Supervisor Instructions:
                 tc_name, tc_args, project_path, godot_interface, asset_interface, approved_assets
             )
 
-            execution_log.append(f"[{tc_name}]: {tool_result[:400]}")
+            # Track which scene is open so add_node log lines carry scene context
+            if tc_name in ("open_scene", "create_scene") and "Failed" not in tool_result[:6]:
+                sp = tc_args.get("scene_path") or tc_args.get("path", "")
+                if sp:
+                    _current_open_scene = sp if sp.startswith("res://") else f"res://{sp}"
+
+            if tc_name == "add_node" and _current_open_scene:
+                execution_log.append(f"[add_node]: {tool_result[:380]} (scene: {_current_open_scene})")
+            else:
+                execution_log.append(f"[{tc_name}]: {tool_result[:400]}")
 
             # Handle test_game screenshot
             if tc_name == "test_game":
@@ -1074,7 +1285,7 @@ Supervisor Instructions:
     # Auto-save safety net (if coder modified a scene but forgot save_scene)
     # Skip if max iterations hit — we don't know if the scene is in a good state.
     # -----------------------------------------------------------------------
-    modified_tools = {"add_node", "set_property", "attach_script", "instance_scene"}
+    modified_tools = {"add_node", "set_property", "attach_script", "instance_scene", "delete_node"}
     executed_tool_names = {
         line.split("]")[0].lstrip("[") for line in execution_log if line.startswith("[")
     }
@@ -1174,6 +1385,9 @@ Check for:
 5. Collision shapes: was a shape resource (RectangleShape2D, CapsuleShape2D, etc.) set on each CollisionShape2D — not just the node added?
 6. Node naming: Were any nodes added with generic type-based names (e.g. 'Sprite2D', 'CollisionShape2D', 'CharacterBody2D', 'Node2D' as a node name)? These cause name clashes with sub-scene instances. Flag this and recommend short semantic names like 'Sprite', 'Collision'.
 7. Duplicate actions: Are there repeated add_node or instance_scene calls targeting the same node path? Each node should only be added once. If a 'Skipped: Node ... already exists' message appeared, verify the coder did not try to add it again.
+8. Scene architecture violations: Did the Coder call `add_node` to place an entity-type node (CharacterBody2D, RigidBody2D, Area2D, or similar) directly in the main or level scene instead of using `instance_scene`? This is a critical error — flag it.
+9. Component node placement: Did the Coder call `add_node` to place any component node (Sprite2D, CollisionShape2D, AudioStreamPlayer, AnimationPlayer, Camera2D, etc.) directly in the main or level scene? These belong only inside their entity's own .tscn. Adding them directly to main.tscn causes Godot "name clashes" load errors when the entity is instanced. Flag any such calls.
+10. Root-type duplication: If `create_scene` was called with a root type (e.g. CharacterBody2D), was `add_node` then called with the same type under parent `"."`? That creates a duplicate root-type child — flag it.
 
 If everything is correct and complete, respond with ONLY the word "APPROVED".
 If there are issues, list them with specific fix instructions."""
@@ -1190,7 +1404,8 @@ If there are issues, list them with specific fix instructions."""
         system_msg = "You are a code reviewer specializing in Godot 4.x GDScript. You are thorough but fair."
 
     try:
-        review = await asyncio.to_thread(
+        review = await _run_llm_step_with_retries(
+            "Reviewer",
             llm_provider.generate,
             prompt=prompt_content,
             system_instruction=system_msg,
@@ -1207,6 +1422,7 @@ If there are issues, list them with specific fix instructions."""
                 "messages": [approval_message]
             }
         else:
+            logger.warning(f"[Reviewer] Sending feedback to Coder:\n{review}")
             feedback_message = AIMessage(content=f"[Reviewer]: Issues found:\n{review}")
             log_node_done("Reviewer", "issues found — looping back to Coder")
             return {
@@ -1289,5 +1505,3 @@ def human_review_node(state: StudioState) -> Dict:
 
     # No feedback yet — waiting for user input (handled by Orchestrator interrupt)
     return {}
-
-
