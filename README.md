@@ -2,7 +2,7 @@
 
 **An AI game development assistant for Godot 4.**
 
-Describe what you want to build in plain English. Genesis Engine writes the GDScript, creates the scenes, wires up the nodes, and generates the assets — all inside your Godot editor, without you leaving it.
+Describe what you want to build in plain English. It can even be a simple idea or mechanic. Genesis Engine helps you turn them into actual game designs, and then fully execute it, including creating all nodes, scenes, scripts, and even aquiring assets, all inside your Godot editor, without you leaving it.
 
 > **Status:** Early release. Expect rough edges. Please open an issue if something breaks.
 
@@ -19,9 +19,9 @@ Genesis Engine is a Godot 4 editor plugin that runs a local AI backend (Python +
 - Writes and attaches GDScript
 - Instances sub-scenes into parent scenes
 - Sets the main scene so F5 works immediately
-- Generates placeholder sprites and audio
+- Generates sprites and audio. (These may not be very good, and you may have to change them yourself. Please check licenses for downloaded images).
 
-**Review mode** — After execution the AI reviews its own output, finds bugs, and proposes fixes you can accept or reject.
+**Review mode** — The AI system can never quite be perfect without user input. This allows you to ask the ai to make bug fixes or tweak the game.
 
 **Asset review** — Before any generated image or audio is written to your project, a preview dialog lets you approve or regenerate it.
 
@@ -80,7 +80,7 @@ Once installation finishes the backend starts and the chat dock becomes active. 
 
 1. Select **Planning** mode in the dock
 2. Describe your game: *"A top-down dungeon crawler with a player character, enemies that patrol, and collectible coins"*
-3. The AI produces a Game Design Document in the right panel
+3. Iterate with the AI to create a game design document
 4. Click **Generate Tasks** to break the GDD into a numbered task list
 5. Switch to **Execution** mode when you're happy with the plan
 
@@ -95,8 +95,8 @@ Once installation finishes the backend starts and the chat dock becomes active. 
 
 ### Reviewing and fixing
 
-- Switch to **Review** mode at any point to have the AI inspect the current state of the project and propose a fix
-- Click **Execute Fix** to apply it
+- Switch to **Review** mode at any point to instruct the ai to make specfic bug fixes or tweaks.
+- AI will create a plan for the fix. Click **Execute Fix** to apply it
 
 ### Rolling back
 
@@ -138,7 +138,7 @@ Check the terminal output for the error. Common causes:
 Another process is using the port the backend needs. Find and stop it, then restart the backend via Settings → Save & Restart Backend.
 
 **The AI generates scenes but they look empty in the editor**
-Press **Ctrl+R** to rescan the filesystem. If the scene still looks wrong, check the backend terminal for errors during that task.
+Press **Ctrl+R** to rescan the filesystem. If the scene still looks wrong, check the backend terminal for errors during that task. Note that rate limits aren't always interpretted correctly. Repeated server side erros may break task execution. Please revert to state before task to try again.
 
 **Tasks run but no assets are generated**
 If using Gemini Imagen, confirm your API key has Imagen access enabled (requires a paid tier). If using Local Diffusers, make sure `torch` and `diffusers` are installed in the `.venv`.
