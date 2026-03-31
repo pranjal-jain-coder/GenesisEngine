@@ -177,4 +177,4 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-*Built by [Pranjal Jain](https://github.com/pranjaljain0)*
+*Built by [Pranjal Jain](https://github.com/pranjal-jain-coder)*
