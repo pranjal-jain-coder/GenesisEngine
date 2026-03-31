@@ -116,7 +116,7 @@ func _handle_incoming_message(message: String) -> void:
 	elif data.has("type"):
 		# Check for known types to forward to UI
 		var type = data["type"]
-		if type in ["chat_response", "task_list", "status", "task_started", "task_completed", "error", "task_history", "project_reverted", "asset_review_request", "gdd_update", "task_verification_request"]:
+		if type in ["chat_response", "task_list", "status", "task_started", "task_completed", "error", "task_history", "project_reverted", "asset_review_request", "gdd_update", "task_verification_request", "review_task_ready"]:
 			# Forward these directly to the UI
 			message_received.emit(data)
 		else:

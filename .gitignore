@@ -1,2 +1,22 @@
 .claude
-venv
+# Root-level dev venv (legacy location)
+venv/
+
+# Plugin backend — generated at runtime, never committed
+addons/genesis_bridge/backend/.venv/
+addons/genesis_bridge/backend/.env
+addons/genesis_bridge/backend/.pid
+addons/genesis_bridge/backend/__pycache__/
+addons/genesis_bridge/backend/**/__pycache__/
+addons/genesis_bridge/backend/data/gemini_usage.json
+addons/genesis_bridge/backend/logs/
+addons/genesis_bridge/backend/test_outputs/
+
+# Root backend dev directory — same exclusions
+backend/venv/
+backend/.env
+backend/__pycache__/
+backend/**/__pycache__/
+backend/data/gemini_usage.json
+backend/logs/
+backend/test_outputs/

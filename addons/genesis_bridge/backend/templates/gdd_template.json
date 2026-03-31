@@ -1,0 +1,28 @@
+{
+    "title": "",
+    "genre": "",
+    "target_audience": "",
+    "core_loop": "",
+    "story": "",
+    "theme": "",
+    "mechanics": [],
+    "controls": "",
+    "progression": "",
+    "art_style": {
+        "visual_style": "",
+        "color_palette": [],
+        "perspective": ""
+    },
+    "audio_style": "",
+    "levels": [],
+    "enemies": [],
+    "items": [],
+    "detailed_systems": [],
+    "folder_structure": [
+        "scenes/",
+        "scripts/",
+        "assets/sprites/",
+        "assets/audio/",
+        "assets/fonts/"
+    ]
+}

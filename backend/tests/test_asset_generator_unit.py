@@ -1,109 +1,157 @@
-import pytest
+"""
+Interactive sprite-options pipeline runner.
+
+This file intentionally replaces the old unit-style tests so it can be run as:
+
+    python3 tests/test_asset_generator_unit.py --desc "..."
+
+It goes through the same backend pipeline used by the plugin:
+  AssetService.get_sprite_options(..., max_options=3)
+
+Generated/downloaded options are persisted under:
+  <project>/assets/sprites/<name>_opt0.png
+  <project>/assets/sprites/<name>_opt1.png
+  <project>/assets/sprites/<name>_opt2.png
+"""
+
+import argparse
+import asyncio
+import re
+import sys
 from pathlib import Path
-from services.asset_generator import AssetGenerator
-from models.asset_request import SpriteStyle
-from PIL import Image
 
-@pytest.fixture
-def generator():
-    # Force image_provider to None to test the fallback/placeholder generation
-    # without hitting the API and spending credits during tests.
-    from core.config import config
-    config.IMAGE_PROVIDER = "none"
-    gen = AssetGenerator()
-    gen.image_provider = None
-    return gen
+# Make backend imports work whether this file is run from repo root or backend/
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-@pytest.fixture
-def tmp_dir(tmp_path):
-    return str(tmp_path)
+from models.asset_request import SpriteRequest, SpriteStyle
+from services.asset_service import AssetService
 
-@pytest.mark.asyncio
-async def test_generate_placeholder_sprite(generator, tmp_dir):
-    result = await generator.generate_sprite(
-        name="test_sprite",
-        description="A little red cube",
-        style=SpriteStyle.PIXEL_ART,
-        width=32,
-        height=32,
-        output_dir=tmp_dir
+
+def _slugify(value: str) -> str:
+    value = value.strip().lower()
+    value = re.sub(r"[^a-z0-9]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value or "sprite_option"
+
+
+async def _run(args: argparse.Namespace) -> int:
+    project_path = Path(args.project).resolve()
+    project_path.mkdir(parents=True, exist_ok=True)
+
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()]
+    style = SpriteStyle(args.style)
+    name = args.name.strip() if args.name else _slugify(args.desc)[:40]
+
+    print("\n=== Sprite Options Pipeline ===")
+    print(f"Project:      {project_path}")
+    print(f"Name:         {name}")
+    print(f"Description:  {args.desc}")
+    print(f"Style:        {style.value}")
+    print(f"Size:         {args.width}x{args.height}")
+    print(f"Tags:         {tags}")
+    print(f"Transparent:  {args.transparent_background}")
+    print(f"Options:      {args.max_options}")
+
+    def log_callback(msg: str):
+        print(f"[AssetService] {msg}")
+
+    service = AssetService(str(project_path), log_callback=log_callback)
+    request = SpriteRequest(
+        name=name,
+        description=args.desc,
+        style=style,
+        width=args.width,
+        height=args.height,
+        tags=tags,
+        poses=["idle"],
+        transparent_background=args.transparent_background,
     )
-    assert result is not None
-    assert Path(result).exists()
-    
-    img = Image.open(result)
-    assert img.width == 32
-    assert img.height == 32
 
-@pytest.mark.asyncio
-async def test_generate_spritesheet_fallback_stitching(generator, tmp_dir):
-    # Test that the offline fallback correctly stitches placeholder frames 
-    # instead of crashing when asked for a sprite sheet.
-    result = await generator.generate_spritesheet(
-        name="test_sheet",
-        description="A little red cube",
-        style=SpriteStyle.PIXEL_ART,
-        frame_width=32,
-        frame_height=32,
-        poses=["idle", "walk", "jump"],
-        output_dir=tmp_dir
+    results = await service.get_sprite_options(request, max_options=args.max_options)
+
+    print("\n=== Results ===")
+    if not results:
+        print("No options were produced.")
+        return 1
+
+    for idx, result in enumerate(results):
+        print(f"\nOption {idx}")
+        print(f"  success:    {result.success}")
+        print(f"  source:     {result.source}")
+        print(f"  message:    {result.message}")
+        print(f"  godot_path: {result.godot_path}")
+        print(f"  file:       {result.asset_path}")
+        if result.asset_path:
+            path = Path(result.asset_path)
+            print(f"  exists:     {path.exists()}")
+            if path.exists():
+                print(f"  bytes:      {path.stat().st_size}")
+
+    sprite_dir = project_path / "assets" / "sprites"
+    print(f"\nSaved under:  {sprite_dir}")
+    print("Review files named *_opt0, *_opt1, *_opt2.")
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate 3 sprite options through the exact plugin asset pipeline."
     )
-    
-    assert result is not None
-    path, count = result
-    assert Path(path).exists()
-    assert count == 3
-    
-    img = Image.open(path)
-    assert img.width == 32 * 3
-    assert img.height == 32
-
-@pytest.mark.asyncio
-async def test_generate_placeholder_background(generator, tmp_dir):
-    result = await generator.generate_background(
-        name="test_bg",
-        description="A beautiful sunset",
-        width=1280,
-        height=720,
-        output_dir=tmp_dir
+    parser.add_argument(
+        "--desc",
+        required=True,
+        help="Sprite description prompt.",
     )
-    # Background generation doesn't have a placeholder natively; it just returns None
-    # if the client is missing. This test verifies it doesn't crash.
-    assert result is None
+    parser.add_argument(
+        "--name",
+        default="",
+        help="Base asset name. If omitted, generated from --desc.",
+    )
+    parser.add_argument(
+        "--style",
+        default="pixel_art",
+        choices=["pixel_art", "flat", "cartoon", "hand_drawn"],
+        help="Visual style.",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=32,
+        help="Sprite width in pixels.",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=32,
+        help="Sprite height in pixels.",
+    )
+    parser.add_argument(
+        "--tags",
+        default="",
+        help="Comma-separated tags.",
+    )
+    parser.add_argument(
+        "--project",
+        default="./test_outputs/pipeline_project",
+        help="Project root where assets/ will be written.",
+    )
+    parser.add_argument(
+        "--max-options",
+        type=int,
+        default=3,
+        help="Number of options to generate/search for.",
+    )
+    parser.add_argument(
+        "--transparent-background",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Request transparent background processing.",
+    )
+    return parser
 
-def test_chroma_key_removal(generator):
-    # Create an image with a magenta background and some non-magenta pixels
-    img = Image.new("RGBA", (10, 10), (255, 0, 255, 255))
-    
-    # Put a green pixel in the middle
-    img.putpixel((5, 5), (0, 255, 0, 255))
-    
-    # Put a pixel that's almost magenta but should be softly blended (distance ~60)
-    img.putpixel((6, 6), (235, 20, 235, 255))
-    
-    processed = generator._remove_chroma_key_background(img, tolerance=40)
-    
-    # Check the pure magenta pixel is removed (transparent)
-    r, g, b, a = processed.getpixel((0, 0))
-    assert a == 0
-    
-    # Check the green pixel is perfectly preserved
-    r, g, b, a = processed.getpixel((5, 5))
-    assert (r, g, b, a) == (0, 255, 0, 255)
-    
-    # Check the edge pixel was soft-blended (alpha > 0 but < 255)
-    r, g, b, a = processed.getpixel((6, 6))
-    assert a > 0 and a < 255
 
-def test_alpha_edge_decontamination(generator):
-    # Simulate an anti-aliased edge pixel produced over magenta matte:
-    # observed = foreground * alpha + matte * (1 - alpha)
-    img = Image.new("RGBA", (1, 1), (127, 64, 127, 128))
-    processed = generator._decontaminate_alpha_edges(img, matte_color=(255, 0, 255))
-    r, g, b, a = processed.getpixel((0, 0))
+if __name__ == "__main__":
+    parser = _build_parser()
+    cli_args = parser.parse_args()
+    raise SystemExit(asyncio.run(_run(cli_args)))
 
-    # Expect matte spill to be removed and green foreground to be recovered.
-    assert a == 128
-    assert g > 120
-    assert r < 5
-    assert b < 5

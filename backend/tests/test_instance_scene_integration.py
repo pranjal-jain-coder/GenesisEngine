@@ -4,25 +4,37 @@ Integration test for instance_scene  –  no LLM required.
 
 WHAT IT CHECKS
 ==============
-Creates a temporary sub-scene (CharacterBody2D) that has child nodes
-(Sprite2D "Visuals" + CollisionShape2D "Collision"), then instances
-it into a temporary main scene and saves.  The saved .tscn must contain only
-a single [node … instance=ExtResource(…)] line for the sub-scene root.
+Mirrors the exact workflow the AI uses:
+  create_scene(main) → create_scene(sub) → add_node×2 → save_scene(sub)
+  → open_scene(main) → instance_scene(sub) → save_scene(main)
 
-If the _clear_children_owner / _prepare_scene_for_saving logic in
-bridge_client.gd is broken, PackedScene.pack() serialises the sub-scene's
-children as local-override entries in the main scene:
+The saved main .tscn must contain only a single
+[node … instance=ExtResource(…)] line for the sub-scene root.
 
-    [node name="Visuals" type="Sprite2D" parent="CharacterB2"]   ← BUG
+ROOT CAUSE OF THE BUG
+=====================
+_cmd_instance_scene calls _set_owner_recursive(instance, edited_scene),
+which sets owner=main_scene_root on every child of the instance.
+PackedScene.pack() then serialises those children as local nodes:
+
+    [node name="Visuals" type="Sprite2D" parent="CharacterBody2D"]  ← BUG
 
 That produces "Load Error: name clashes" the next time Godot opens the file.
+
+WHY THE SAVE BEFORE open_scene MATTERS
+=======================================
+_cmd_create_scene does NOT auto-save the currently open scene before
+switching.  If save_scene is omitted after building the sub-scene, the
+sub-scene has no children on disk when instance_scene calls load().
+The instance is empty → nothing to duplicate → test trivially passes
+without ever exercising the bug.
 
 HOW TO RUN
 ==========
   1. Stop the main backend (main.py) — it also listens on port 8000.
   2. Open Godot with the genesis_bridge plugin active.
      The bridge auto-reconnects; it will find this test server.
-  3.  cd backend && venv/bin/python tests/test_instance_scene_integration.py
+  3.  cd backend && python tests/test_instance_scene_integration.py
 
 Exit code 0 = PASS, exit code 1 = FAIL or error.
 """
@@ -143,16 +155,17 @@ async def run_test(bridge: DirectBridge, project_path: str) -> bool:
     passed = True
 
     def step(n, msg):
-        print(f"    [{n}/5] {msg}")
-
-    # Pre-clean any leftovers from a previous failed run
-    for res_path in (TEMP_SUB, TEMP_MAIN):
-        disk = Path(project_path) / res_path.replace("res://", "")
-        disk.unlink(missing_ok=True)
+        print(f"    [{n}/6] {msg}")
 
     try:
-        # ── 1. Build a sub-scene that has child nodes ──────────────────────
-        step(1, f"create_scene {TEMP_SUB}  (root=CharacterBody2D, children=Visuals+Collision)")
+        # ── 1. Create the main scene (empty, just establishes the file) ────
+        step(1, f"create_scene {TEMP_MAIN}  (root=Node2D, empty)")
+        r = await iface.create_scene(project_path, TEMP_MAIN, "Node2D")
+        if "Failed" in r or "Error" in r:
+            raise RuntimeError(f"create_scene(main) → {r}")
+
+        # ── 2. Build the sub-scene with children ───────────────────────────
+        step(2, f"create_scene {TEMP_SUB}  (root=CharacterBody2D, children=Visuals+Collision)")
         r = await iface.create_scene(project_path, TEMP_SUB, "CharacterBody2D")
         if "Failed" in r or "Error" in r:
             raise RuntimeError(f"create_scene(sub) → {r}")
@@ -165,27 +178,34 @@ async def run_test(bridge: DirectBridge, project_path: str) -> bool:
         if "Failed" in r or "Error" in r:
             raise RuntimeError(f"add_node(Collision) → {r}")
 
-        # ── 2. Build the main scene ────────────────────────────────────────
-        # create_scene auto-saves the currently open scene (sub-scene) first
-        step(2, f"create_scene {TEMP_MAIN}  (auto-saves sub-scene first)")
-        r = await iface.create_scene(project_path, TEMP_MAIN, "Node2D")
+        # ── 3. Save sub-scene explicitly ───────────────────────────────────
+        # Critical: the AI always saves before switching scenes.
+        # Without this, the sub-scene has no children on disk and
+        # instance_scene loads an empty scene — the bug never triggers.
+        step(3, f"save_scene  ({TEMP_SUB} with its children)")
+        r = await iface.save_scene(project_path)
         if "Failed" in r or "Error" in r:
-            raise RuntimeError(f"create_scene(main) → {r}")
+            raise RuntimeError(f"save_scene(sub) → {r}")
 
-        # ── 3. Instance the sub-scene ──────────────────────────────────────
-        step(3, f"instance_scene {TEMP_SUB}  parent='.'")
+        # ── 4. Switch to the main scene (open_scene, like the AI does) ─────
+        step(4, f"open_scene {TEMP_MAIN}")
+        r = await iface.open_scene(project_path, TEMP_MAIN)
+        if "Failed" in r or "Error" in r:
+            raise RuntimeError(f"open_scene(main) → {r}")
+
+        # ── 5. Instance the sub-scene ──────────────────────────────────────
+        step(5, f"instance_scene {TEMP_SUB}  parent='.'")
         r = await iface.instance_scene(project_path, TEMP_SUB, ".")
         if "Failed" in r or "Error" in r:
             raise RuntimeError(f"instance_scene → {r}")
 
-        # ── 4. Save ────────────────────────────────────────────────────────
-        step(4, "save_scene")
+        # ── 6. Save and inspect ────────────────────────────────────────────
+        step(6, "save_scene")
         r = await iface.save_scene(project_path)
         if "Failed" in r or "Error" in r:
-            raise RuntimeError(f"save_scene → {r}")
+            raise RuntimeError(f"save_scene(main) → {r}")
 
-        # ── 5. Inspect the saved .tscn file on disk ────────────────────────
-        step(5, f"parsing {TEMP_MAIN} for duplicate [node] entries …")
+        step(6, f"parsing {TEMP_MAIN} for duplicate [node] entries …")
         disk_path = Path(project_path) / TEMP_MAIN.replace("res://", "")
         if not disk_path.exists():
             raise FileNotFoundError(f"Expected file not found: {disk_path}")
@@ -213,17 +233,12 @@ async def run_test(bridge: DirectBridge, project_path: str) -> bool:
 
     finally:
         try:
-            print("    Final save_scene (end-of-test flush) …")
+            print("    Final save_scene …")
             r = await iface.save_scene(project_path)
             if "Failed" in r or "Error" in r:
                 print(f"    Warning: final save_scene reported: {r}")
         except Exception as exc:
             print(f"    Warning: final save_scene failed: {exc}")
-
-        print("    Cleaning up temp scenes …")
-        for res_path in (TEMP_SUB, TEMP_MAIN):
-            disk = Path(project_path) / res_path.replace("res://", "")
-            disk.unlink(missing_ok=True)
 
     return passed
 

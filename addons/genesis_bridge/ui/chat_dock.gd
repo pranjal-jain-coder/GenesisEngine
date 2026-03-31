@@ -4,10 +4,16 @@ extends Control
 # Genesis Engine Chat Dock UI
 # Provides a chat interface for interacting with AI agents
 
-const GDDPanel = preload("res://addons/genesis_bridge/ui/gdd_panel.gd")
-const TaskItem = preload("res://addons/genesis_bridge/ui/task_item.gd")
+const GDDPanel        = preload("res://addons/genesis_bridge/ui/gdd_panel.gd")
+const TaskItem        = preload("res://addons/genesis_bridge/ui/task_item.gd")
+const SetupPanel      = preload("res://addons/genesis_bridge/ui/setup_panel.gd")
+const SettingsDialog  = preload("res://addons/genesis_bridge/ui/settings_dialog.gd")
 
 signal message_sent(mode: String, message: String)
+## Relayed to genesis_bridge.gd to trigger venv creation + backend start.
+signal setup_requested(python_path: String, api_key: String)
+## Relayed to genesis_bridge.gd to rewrite .env and restart the backend.
+signal settings_saved
 
 @onready var message_container: VBoxContainer
 @onready var scroll_container: ScrollContainer
@@ -17,6 +23,10 @@ signal message_sent(mode: String, message: String)
 @onready var gdd_panel: Control
 
 var bridge_client: Node = null
+var _setup_panel: Control = null
+var _settings_dialog: Window = null
+var _main_content: Control = null   # the HSplitContainer holding chat + GDD
+var _content_vbox: VBoxContainer = null
 var loading_message: PanelContainer = null
 var loading_timer: Timer = null
 var loading_dots: int = 0
@@ -24,11 +34,12 @@ var execution_status_label: Label = null
 var execution_loading_base_text: String = ""
 var current_executing_task_id: String = "" # Track active task for reconnection
 
-# Tracks the current pending asset review so feedback / option selection can be sent
 var pending_asset_review: Dictionary = {}
 
 # Reference to the currently open review dialog (if any)
 var _review_dialog: Window = null
+
+var execute_fix_btn: Button = null
 
 @onready var execution_ui: VBoxContainer
 @onready var task_list: VBoxContainer
@@ -36,6 +47,7 @@ var _review_dialog: Window = null
 @onready var gen_btn: Button
 @onready var exec_btn: Button
 @onready var feedback_btn: Button
+@onready var gen_more_btn: Button
 
 func _ready() -> void:
 	_build_ui()
@@ -53,6 +65,7 @@ func _build_ui() -> void:
 	var vbox = VBoxContainer.new()
 	vbox.set_anchors_preset(Control.PRESET_FULL_RECT)
 	margin.add_child(vbox)
+	_content_vbox = vbox
 	
 	# Create split container for chat and GDD panel
 	var hsplit = HSplitContainer.new()
@@ -76,10 +89,26 @@ func _build_ui() -> void:
 	mode_selector = OptionButton.new()
 	mode_selector.add_item("Planning", 0)
 	mode_selector.add_item("Execution", 1)
+	mode_selector.add_item("Review", 2)
 	mode_selector.custom_minimum_size = Vector2(120, 0)
 	mode_selector.item_selected.connect(_on_mode_changed)
 	header.add_child(mode_selector)
-	
+
+	# Spacer pushes gear button to the right
+	var spacer = Control.new()
+	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	header.add_child(spacer)
+
+	var gear_btn = Button.new()
+	gear_btn.flat = true
+	gear_btn.tooltip_text = "Settings"
+	if Engine.is_editor_hint() and has_theme_icon("Tools", "EditorIcons"):
+		gear_btn.icon = get_theme_icon("Tools", "EditorIcons")
+	else:
+		gear_btn.text = "⚙"
+	gear_btn.pressed.connect(_on_settings_pressed)
+	header.add_child(gear_btn)
+
 	var separator1 = HSeparator.new()
 	left_vbox.add_child(separator1)
 	
@@ -112,6 +141,13 @@ func _build_ui() -> void:
 	send_button.text = "Send"
 	send_button.pressed.connect(_on_send_pressed)
 	input_box.add_child(send_button)
+	
+	execute_fix_btn = Button.new()
+	execute_fix_btn.text = "Execute Fix"
+	execute_fix_btn.pressed.connect(_on_execute_fix_pressed)
+	execute_fix_btn.visible = false
+	execute_fix_btn.add_theme_color_override("font_color", Color.LIGHT_GREEN)
+	input_box.add_child(execute_fix_btn)
 	
 	### EXECUTION UI ###
 	execution_ui = VBoxContainer.new()
@@ -148,6 +184,13 @@ func _build_ui() -> void:
 	feedback_btn.pressed.connect(_on_regenerate_pressed)
 	feedback_btn.visible = false # Hidden initially
 	controls_box.add_child(feedback_btn)
+
+	gen_more_btn = Button.new()
+	gen_more_btn.text = "Generate More"
+	gen_more_btn.tooltip_text = "Add tasks from GDD changes"
+	gen_more_btn.pressed.connect(_on_generate_more_tasks_pressed)
+	gen_more_btn.visible = false # Hidden until tasks exist
+	controls_box.add_child(gen_more_btn)
 
 	var add_task_btn = Button.new()
 	add_task_btn.text = "+"
@@ -196,11 +239,63 @@ func _build_ui() -> void:
 
 	# Add welcome message
 	add_system_message("Genesis Engine initialized. Select a mode and start chatting!")
-	
+
 	# Right side: GDD Panel
 	gdd_panel = GDDPanel.new()
 	gdd_panel.custom_minimum_size.x = 300
 	hsplit.add_child(gdd_panel)
+
+	_main_content = hsplit
+
+	# Settings dialog — created once, shown on demand
+	_settings_dialog = SettingsDialog.new()
+	_settings_dialog.settings_saved.connect(func(): settings_saved.emit())
+	add_child(_settings_dialog)
+
+	# Setup panel — sits in the same vbox as hsplit; only one is visible at a time
+	_setup_panel = SetupPanel.new()
+	_setup_panel.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_setup_panel.install_requested.connect(_on_install_requested)
+	_setup_panel.visible = false
+	_content_vbox.add_child(_setup_panel)
+
+
+# ─── Backend state API (called by genesis_bridge.gd) ─────────────────────────
+
+## Show the setup panel and hide the normal chat UI.
+func show_setup(message: String = "") -> void:
+	if _setup_panel == null:
+		return
+	if message != "":
+		_setup_panel.set_status(message)
+	if _main_content:
+		_main_content.visible = false
+	_setup_panel.visible = true
+
+
+## Hide the setup panel, restore chat UI, and show a status message.
+func on_backend_starting() -> void:
+	if _setup_panel:
+		_setup_panel.visible = false
+	if _main_content:
+		_main_content.visible = true
+	add_system_message("Backend is starting… connection will be established shortly.")
+
+
+## Update the progress text on the setup panel during pip install.
+func show_install_progress(text: String) -> void:
+	if _setup_panel:
+		_setup_panel.set_progress(text)
+
+
+func _on_install_requested(python_path: String, api_key: String) -> void:
+	setup_requested.emit(python_path, api_key)
+
+
+func _on_settings_pressed() -> void:
+	_settings_dialog.load_settings()
+	_settings_dialog.popup_centered()
+
 
 func set_bridge_client(client: Node) -> void:
 	bridge_client = client
@@ -247,8 +342,9 @@ func _send_message() -> void:
 	if text.is_empty():
 		return
 	
-	# Only for planning mode now
 	var mode = "planning"
+	if mode_selector.selected == 2:
+		mode = "review"
 	
 	# Display user message
 	add_user_message(text)
@@ -267,30 +363,28 @@ func _send_message() -> void:
 	input_field.text = ""
 
 func _on_mode_changed(index: int) -> void:
+	var is_planning = (index == 0)
 	var is_execution = (index == 1)
+	var is_review = (index == 2)
 	
 	# Toggle visibility
 	for el in chat_ui_elements:
-		el.visible = !is_execution
+		el.visible = is_planning or is_review
 	
 	execution_ui.visible = is_execution
 	
-	if is_execution:
-		# Maybe trigger a refresh of tasks if needed, or just show empty state
-		pass
-	else:
-		# Clear messages when switching back to planning provided we want a fresh start or keep history?
-		# Original code cleared it. Let's keep it cleared for now.
+	if is_instance_valid(execute_fix_btn):
+		execute_fix_btn.visible = false
+	
+	if is_planning:
+		# Clear messages when switching to planning
 		for child in message_container.get_children():
 			child.queue_free()
-			
-	var mode_name = "Planning" if index == 0 else "Execution"
-	# add_system_message("Switched to %s mode." % mode_name) # No message log in execution mode
 
 ### EXECUTION ACTIONS ###
 
 func _set_execution_busy(busy: bool, message: String = ""):
-	var buttons = [gen_btn, exec_btn, feedback_btn]
+	var buttons = [gen_btn, exec_btn, feedback_btn, gen_more_btn]
 	for btn in buttons:
 		if is_instance_valid(btn):
 			btn.disabled = busy
@@ -327,6 +421,16 @@ func _on_generate_tasks_pressed():
 			"type": "chat",
 			"mode": "execution",
 			"action": "generate_tasks"
+		})
+
+func _on_generate_more_tasks_pressed():
+	if bridge_client and bridge_client.has_method("send_message"):
+		_set_tasks_loading("Generating More Tasks...")
+		_set_execution_busy(true, "Generating More Tasks...")
+		bridge_client.send_message({
+			"type": "chat",
+			"mode": "execution",
+			"action": "generate_additional_tasks"
 		})
 
 func _on_execute_next_pressed():
@@ -366,6 +470,19 @@ func _on_regenerate_pressed():
 	)
 	add_child(dialog)
 	dialog.popup_centered()
+
+func _on_execute_fix_pressed():
+	if bridge_client and bridge_client.has_method("send_message"):
+		var desc = execute_fix_btn.get_meta("task_description")
+		bridge_client.send_message({
+			"type": "chat",
+			"mode": "review",
+			"action": "execute_fix",
+			"description": desc
+		})
+		execute_fix_btn.visible = false
+		_show_loading()
+		add_system_message("Sent ad-hoc fix execution request.")
 
 func _on_history_pressed():
 	if bridge_client and bridge_client.has_method("send_message"):
@@ -468,9 +585,11 @@ func _update_task_list(tasks: Array):
 	if tasks.size() > 0:
 		gen_btn.visible = false
 		feedback_btn.visible = true
+		gen_more_btn.visible = true
 	else:
 		gen_btn.visible = true
 		feedback_btn.visible = false
+		gen_more_btn.visible = false
 		
 	for task in tasks:
 		var item = TaskItem.new()
@@ -618,22 +737,29 @@ func _on_message_received(message: Dictionary) -> void:
 		pending_asset_review = message
 		_show_asset_review_dialog(message)
 		
+	elif type == "review_task_ready":
+		if mode_selector.selected == 2 and is_instance_valid(execute_fix_btn):
+			_hide_loading()
+			execute_fix_btn.visible = true
+			execute_fix_btn.set_meta("task_description", message.get("description", ""))
+			add_system_message("Ready to execute fix: " + message.get("description", ""))
+			
 	elif type == "status":
-		# Status update from backend studio agent
-		if execution_status_label and execution_status_label.is_visible_in_tree():
-			execution_loading_base_text = message.get("content", "Working...")
-			execution_status_label.text = execution_loading_base_text
-		else:
-			add_system_message(message.get("content", ""))
+		# Detailed logs go to the backend console window — only show a short
+		# summary in the status label, never dump the full text into chat.
+		if execution_status_label:
+			var text = message.get("content", "Working...")
+			execution_loading_base_text = text.left(72) + ("…" if text.length() > 72 else "")
+			if execution_status_label.is_visible_in_tree():
+				execution_status_label.text = execution_loading_base_text
 
 	elif type == "log":
-		# Live asset pipeline logs and system status
-		# If we are in execution mode and loading, update the base text
-		if execution_status_label and execution_status_label.is_visible_in_tree():
-			execution_loading_base_text = message.get("message", "Working...")
-			execution_status_label.text = execution_loading_base_text
-		else:
-			add_system_message(message.get("message", ""))
+		# Same as "status" — detailed output is in the terminal window.
+		if execution_status_label:
+			var text = message.get("message", "Working...")
+			execution_loading_base_text = text.left(72) + ("…" if text.length() > 72 else "")
+			if execution_status_label.is_visible_in_tree():
+				execution_status_label.text = execution_loading_base_text
 
 	# Handle GDD updates
 	if message.has("gdd") or (type == "gdd_update" and message.has("gdd")):
