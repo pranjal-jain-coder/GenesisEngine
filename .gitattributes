@@ -1,5 +1,5 @@
 # Auto detect text files and perform LF normalization
-* text=auto
+* text=auto eol=lf
 
 # Standard text files
 *.gd text eol=lf
@@ -28,3 +28,8 @@
 *.otf binary
 *.woff binary
 *.woff2 binary
+
+# Only include the addons folder when downloading from the Asset Library.
+/**        export-ignore
+/addons    !export-ignore
+/addons/** !export-ignore
