@@ -1,0 +1,30 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Standard text files
+*.gd text eol=lf
+*.py text eol=lf
+*.cfg text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+
+# Godot specific
+*.tscn text eol=lf
+*.tres text eol=lf
+*.project text eol=lf
+*.godot text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ogg binary
+*.wav binary
+*.mp3 binary
+*.exr binary
+*.hdr binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
